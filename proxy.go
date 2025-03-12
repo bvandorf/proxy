@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -24,11 +25,15 @@ type ProxyConfig struct {
 	ClientTLS bool // Whether clients should use TLS to connect to proxy
 	TargetTLS bool // Whether the proxy should use TLS to connect to target
 
-	// TLS configuration
-	ServerCertFile  string      // Path to server certificate file for client-proxy TLS
-	ServerKeyFile   string      // Path to server key file for client-proxy TLS
-	CACertFile      string      // Path to CA certificate file for client verification
-	TargetTLSConfig *tls.Config // Custom TLS configuration for proxy-to-target
+	// TLS configuration for client-to-proxy connections
+	ServerCertFile string // Path to server certificate file for client-proxy TLS
+	ServerKeyFile  string // Path to server key file for client-proxy TLS
+	CACertFile     string // Path to CA certificate file for client verification
+
+	// TLS configuration for proxy-to-target connections
+	TargetTLSConfig      *tls.Config // Custom TLS configuration for proxy-to-target
+	TargetClientCertFile string      // Path to client certificate file for proxy-target TLS
+	TargetClientKeyFile  string      // Path to client key file for proxy-target TLS
 
 	// Client authentication
 	ClientAuth bool // Whether client certificate authentication is required
@@ -39,6 +44,30 @@ type ProxyConfig struct {
 
 // NewProxyConfig creates a default proxy configuration
 func NewProxyConfig(listenerAddr, targetAddr string) *ProxyConfig {
+	// Check if target address has a port specified
+	host, _, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		// If there's an error, it might be because no port was specified
+		// Check if the error indicates missing port
+		if strings.Contains(err.Error(), "missing port") {
+			// No port specified, use the host as is
+			host = targetAddr
+
+			// Extract port from listener address
+			_, listenerPort, listenerErr := net.SplitHostPort(listenerAddr)
+			if listenerErr == nil {
+				// Use the listener port for the target
+				targetAddr = net.JoinHostPort(host, listenerPort)
+				log.Printf("No port specified in target address. Using listener port %s -> %s", host, targetAddr)
+			} else {
+				log.Printf("Warning: Could not determine port from listener address: %v", listenerErr)
+			}
+		} else {
+			// Some other error occurred
+			log.Printf("Warning: Invalid target address format: %v", err)
+		}
+	}
+
 	return &ProxyConfig{
 		ListenerAddress: listenerAddr,
 		TargetAddress:   targetAddr,
@@ -71,6 +100,15 @@ func (c *ProxyConfig) WithTargetTLSConfig(config *tls.Config) *ProxyConfig {
 	return c
 }
 
+// WithTargetClientCert configures the proxy to use a client certificate when connecting to the target server
+// This is useful when the target server requires client certificate authentication
+func (c *ProxyConfig) WithTargetClientCert(certFile, keyFile string) *ProxyConfig {
+	c.TargetTLS = true
+	c.TargetClientCertFile = certFile
+	c.TargetClientKeyFile = keyFile
+	return c
+}
+
 // WithTLS configures the proxy to use TLS for both client-to-proxy and proxy-to-target connections
 func (c *ProxyConfig) WithTLS(serverCertFile, serverKeyFile string) *ProxyConfig {
 	c.WithClientTLS(serverCertFile, serverKeyFile)
@@ -82,6 +120,16 @@ func (c *ProxyConfig) WithTLS(serverCertFile, serverKeyFile string) *ProxyConfig
 func (c *ProxyConfig) WithClientAuth(caCertFile, serverCertFile, serverKeyFile string) *ProxyConfig {
 	c.ClientAuth = true
 	c.CACertFile = caCertFile
+	c.ServerCertFile = serverCertFile
+	c.ServerKeyFile = serverKeyFile
+	return c
+}
+
+// WithInsecureClientAuth configures the proxy to require client certificates but accept any certificate
+// This is useful for testing but should not be used in production
+func (c *ProxyConfig) WithInsecureClientAuth(serverCertFile, serverKeyFile string) *ProxyConfig {
+	c.ClientAuth = true
+	c.CACertFile = "" // No CA cert means we won't validate against a specific CA
 	c.ServerCertFile = serverCertFile
 	c.ServerKeyFile = serverKeyFile
 	return c
@@ -108,6 +156,12 @@ type Proxy struct {
 	wg              sync.WaitGroup
 	tlsConfig       *tls.Config // TLS config for proxy-to-server
 	clientTLSConfig *tls.Config // TLS config for client-to-proxy
+
+	// For custom response handling
+	currentClientConn net.Conn
+	currentTargetConn net.Conn   // Track current target connection for possible reuse
+	isTargetConnInUse bool       // Flag indicating if the target connection is being used for proxying
+	connMutex         sync.Mutex // Mutex for safe access to connections
 }
 
 // NewProxy creates a new proxy instance with the given configuration
@@ -127,15 +181,31 @@ func NewProxy(config *ProxyConfig) *Proxy {
 	// Apply target TLS configuration if specified
 	if config.TargetTLS {
 		// Use custom TLS config if provided, otherwise create a default one
+		var targetTLSConfig *tls.Config
+
 		if config.TargetTLSConfig != nil {
-			proxy.tlsConfig = config.TargetTLSConfig
+			targetTLSConfig = config.TargetTLSConfig.Clone()
 		} else {
 			// Configure proxy-to-target TLS with a default config
-			targetTLSConfig := &tls.Config{
+			targetTLSConfig = &tls.Config{
 				InsecureSkipVerify: true, // Note: In production, this should be false
 			}
-			proxy.tlsConfig = targetTLSConfig
 		}
+
+		// If target client certificates are provided, load and add them
+		if config.TargetClientCertFile != "" && config.TargetClientKeyFile != "" {
+			// Load client certificate
+			clientCert, err := tls.LoadX509KeyPair(config.TargetClientCertFile, config.TargetClientKeyFile)
+			if err != nil {
+				log.Printf("Warning: Failed to load target client certificate: %v", err)
+			} else {
+				// Add the client certificate to the config
+				targetTLSConfig.Certificates = append(targetTLSConfig.Certificates, clientCert)
+				log.Printf("Target client certificate loaded successfully for proxy-to-target authentication")
+			}
+		}
+
+		proxy.tlsConfig = targetTLSConfig
 	}
 
 	// Apply client TLS and authentication settings if specified
@@ -170,24 +240,27 @@ func (p *Proxy) setupClientTLS() error {
 	// If client authentication is required, set it up
 	if p.config.ClientAuth {
 		if p.config.CACertFile == "" {
-			return fmt.Errorf("missing CA certificate file for client authentication")
-		}
+			// Insecure mode - require client cert but don't verify it against a CA
+			log.Printf("Warning: Using insecure client authentication mode - client certificates will be requested but not verified")
+			clientTLSConfig.ClientAuth = tls.RequestClientCert
+		} else {
+			// Secure mode - require and verify client cert against CA
+			// Read CA certificate for client verification
+			caCert, err := os.ReadFile(p.config.CACertFile)
+			if err != nil {
+				return fmt.Errorf("failed to read CA certificate: %w", err)
+			}
 
-		// Read CA certificate for client verification
-		caCert, err := os.ReadFile(p.config.CACertFile)
-		if err != nil {
-			return fmt.Errorf("failed to read CA certificate: %w", err)
-		}
+			// Create CA certificate pool and add our CA certificate
+			caCertPool := x509.NewCertPool()
+			if ok := caCertPool.AppendCertsFromPEM(caCert); !ok {
+				return fmt.Errorf("failed to add CA certificate to pool")
+			}
 
-		// Create CA certificate pool and add our CA certificate
-		caCertPool := x509.NewCertPool()
-		if ok := caCertPool.AppendCertsFromPEM(caCert); !ok {
-			return fmt.Errorf("failed to add CA certificate to pool")
+			// Configure client authentication
+			clientTLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
+			clientTLSConfig.ClientCAs = caCertPool
 		}
-
-		// Configure client authentication
-		clientTLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
-		clientTLSConfig.ClientCAs = caCertPool
 	}
 
 	// Apply the configuration
@@ -280,6 +353,21 @@ func (p *Proxy) StartTLS() error {
 
 // handleConnection manages the proxy between client and server
 func (p *Proxy) handleConnection(clientConn net.Conn) error {
+	// Store the client connection for potential custom responses
+	p.connMutex.Lock()
+	p.currentClientConn = clientConn
+	p.currentTargetConn = nil // Reset target connection at start of new client connection
+	p.connMutex.Unlock()
+
+	// Make sure to clear the client connection reference when we're done
+	defer func() {
+		p.connMutex.Lock()
+		if p.currentClientConn == clientConn {
+			p.currentClientConn = nil
+		}
+		p.connMutex.Unlock()
+	}()
+
 	// Connect to target
 	var targetConn net.Conn
 	var err error
@@ -316,6 +404,22 @@ func (p *Proxy) handleConnection(clientConn net.Conn) error {
 		return fmt.Errorf("failed to connect to target: %w", err)
 	}
 	defer targetConn.Close()
+
+	// Store the target connection for potential reuse
+	p.connMutex.Lock()
+	p.currentTargetConn = targetConn
+	p.isTargetConnInUse = true // Mark connection as in use for proxying
+	p.connMutex.Unlock()
+
+	// Make sure to clear the target connection when done
+	defer func() {
+		p.connMutex.Lock()
+		if p.currentTargetConn == targetConn {
+			p.currentTargetConn = nil
+			p.isTargetConnInUse = false // Mark as no longer in use
+		}
+		p.connMutex.Unlock()
+	}()
 
 	// Create wait group to wait for both directions to complete
 	var wg sync.WaitGroup
@@ -431,4 +535,205 @@ type ProxyError struct {
 
 func (e *ProxyError) Error() string {
 	return e.message
+}
+
+// SendCustomResponse sends a custom response directly to the client
+// This is useful for intercepting requests and providing custom responses
+// without forwarding to the target server.
+func (p *Proxy) SendCustomResponse(data []byte) error {
+	// Get the current client connection
+	p.connMutex.Lock()
+	defer p.connMutex.Unlock()
+
+	if p.currentClientConn == nil {
+		return fmt.Errorf("no active client connection")
+	}
+
+	// Send the custom response directly to the client
+	_, err := p.currentClientConn.Write(data)
+	return err
+}
+
+// SendCustomServerRequest sends a custom request to the target server
+// and returns the response. If reuseConnection is true, it will try to reuse
+// an existing connection if available and not already in use by the proxy.
+func (p *Proxy) SendCustomServerRequest(request []byte, reuseConnection bool) ([]byte, error) {
+	var targetConn net.Conn
+	var err error
+	var ownConnection bool = false
+
+	// Check if we can reuse an existing connection
+	if reuseConnection {
+		p.connMutex.Lock()
+		if p.currentTargetConn != nil && !p.isTargetConnInUse {
+			// We can reuse the existing connection
+			targetConn = p.currentTargetConn
+			log.Println("Reusing existing target connection for custom request")
+		}
+		p.connMutex.Unlock()
+
+		// Verify the connection is still valid if we're trying to reuse it
+		if targetConn != nil {
+			// Send a test write with a short timeout to see if the connection is still alive
+			err = targetConn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+			if err != nil {
+				log.Println("Failed to set write deadline on reused connection, creating new one:", err)
+				targetConn = nil // Reset to create a new connection
+			} else {
+				// Try to write 0 bytes as a quick connection test
+				_, err = targetConn.Write([]byte{})
+				if err != nil {
+					log.Println("Reused connection appears to be invalid, creating new one:", err)
+					targetConn = nil // Reset to create a new connection
+				}
+			}
+		}
+	}
+
+	// If we don't have a connection yet, create a new one
+	if targetConn == nil {
+		// Connect to target
+		ownConnection = true
+		log.Println("Creating new target connection for custom request")
+
+		// Create a dialer with the configured timeout
+		dialer := &net.Dialer{
+			Timeout: p.config.DialTimeout,
+		}
+
+		// Extract hostname from target address for SNI if needed
+		host, _, err := net.SplitHostPort(p.TargetAddr)
+		if err != nil {
+			// If splitting fails, use the whole target address
+			host = p.TargetAddr
+		}
+
+		// If using TLS to connect to target
+		if p.tlsConfig != nil {
+			// Create a copy of the TLS config to ensure we don't modify the original
+			tlsConfig := p.tlsConfig.Clone()
+
+			// Set the ServerName for SNI if not already set
+			if tlsConfig.ServerName == "" {
+				tlsConfig.ServerName = host
+			}
+
+			// Establish TLS connection to target
+			targetConn, err = tls.DialWithDialer(dialer, "tcp", p.TargetAddr, tlsConfig)
+		} else {
+			targetConn, err = dialer.Dial("tcp", p.TargetAddr)
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to target for custom request: %w", err)
+		}
+
+		// Close the connection when we're done if we created it
+		if ownConnection {
+			defer targetConn.Close()
+		}
+	}
+
+	// Send request to target
+	_, err = targetConn.Write(request)
+	if err != nil {
+		if !ownConnection {
+			// If we're reusing a connection and the write fails, try once more with a new connection
+			log.Println("Write to reused connection failed, retrying with new connection:", err)
+
+			// Create a new connection and try again
+			var newConn net.Conn
+			if p.tlsConfig != nil {
+				newConn, err = tls.Dial("tcp", p.TargetAddr, p.tlsConfig)
+			} else {
+				newConn, err = net.Dial("tcp", p.TargetAddr)
+			}
+
+			if err != nil {
+				return nil, fmt.Errorf("failed to create new connection after write failure: %w", err)
+			}
+			defer newConn.Close()
+
+			// Try the write again
+			_, err = newConn.Write(request)
+			if err != nil {
+				return nil, fmt.Errorf("failed to send request on new connection: %w", err)
+			}
+
+			// Use the new connection for reading the response
+			targetConn = newConn
+		} else {
+			return nil, fmt.Errorf("failed to send request to target: %w", err)
+		}
+	}
+
+	// Read response from target
+	responseBuffer := bytes.NewBuffer(nil)
+	buffer := make([]byte, 4096)
+
+	for {
+		// Set a read deadline to avoid waiting forever
+		err = targetConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if err != nil {
+			return nil, fmt.Errorf("failed to set read deadline: %w", err)
+		}
+
+		n, err := targetConn.Read(buffer)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			// If a timeout occurred and we have some data, we can return it
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() && responseBuffer.Len() > 0 {
+				log.Println("Read timeout occurred, but we have some data to return")
+				break
+			}
+
+			// If we're reusing a connection and the read fails, try once more with a new connection
+			if !ownConnection && responseBuffer.Len() == 0 {
+				log.Println("Read from reused connection failed, retrying with new connection:", err)
+
+				// Create a new connection and try again
+				var newConn net.Conn
+				if p.tlsConfig != nil {
+					newConn, err = tls.Dial("tcp", p.TargetAddr, p.tlsConfig)
+				} else {
+					newConn, err = net.Dial("tcp", p.TargetAddr)
+				}
+
+				if err != nil {
+					return nil, fmt.Errorf("failed to create new connection after read failure: %w", err)
+				}
+				defer newConn.Close()
+
+				// Try the write again
+				_, err = newConn.Write(request)
+				if err != nil {
+					return nil, fmt.Errorf("failed to send request on new connection: %w", err)
+				}
+
+				// Read the response from the new connection
+				n, err = newConn.Read(buffer)
+				if err != nil && err != io.EOF {
+					return nil, fmt.Errorf("failed to read from new connection: %w", err)
+				}
+
+				responseBuffer.Write(buffer[:n])
+				break
+			}
+
+			return nil, fmt.Errorf("failed to read response from target server: %w", err)
+		}
+
+		responseBuffer.Write(buffer[:n])
+
+		// For non-streaming protocols like HTTP, we might want to detect when a response is complete
+		// This is a simple implementation that assumes the entire response comes in a single read
+		// For HTTP, parsing the Content-Length header would be more accurate
+		if n < len(buffer) {
+			break
+		}
+	}
+
+	return responseBuffer.Bytes(), nil
 }

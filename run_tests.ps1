@@ -188,17 +188,93 @@ if ($RunOneByOne) {
     "$separator" | Out-File -FilePath $OutputFile -Append
 }
 
-# Check for common error patterns
-$errorPatterns = @("FAIL", "panic:", "fatal error", "ERROR", "Exception", "runtime error")
+# Replace with a more context-aware error detection approach
 $foundErrors = $false
 
-foreach ($pattern in $errorPatterns) {
-    $matches = Select-String -Path $OutputFile -Pattern $pattern -SimpleMatch -Quiet
+# Common error patterns (general terms that might indicate issues)
+$errorPatterns = @("FAIL", "panic:", "fatal error", "ERROR", "Exception", "runtime error")
+
+# These patterns indicate actual test failures
+$actualFailurePatterns = @(
+    "--- FAIL:",          # Go test failure marker
+    "\bpanic: ",          # Go panic with space after to avoid matching in identifiers
+    "\bfatal error: ",    # Fatal error with space after
+    "\s+FAIL\s+",         # FAIL surrounded by whitespace (test result)
+    "^\s*FAIL\s+",        # FAIL at beginning of line (test result summary)
+    "\bException: ",      # Exception with space after
+    "runtime error: "     # Runtime error with space after
+)
+
+# These are known safe patterns that should be excluded (often in log messages or identifiers)
+$safePatterns = @(
+    "log\.Printf.*ERROR",     # Log statements about errors
+    "log\.Printf.*FAIL",      # Log statements about failures
+    "Found error pattern:",   # From our own script output
+    "ERROR: Test execution failed", # From our catch block
+    "tests requiring TLS may fail", # Certificate generation warning
+    '\"\w*ERROR\w*\"',        # The word ERROR in quotes/string literals
+    '\"\w*FAIL\w*\"',         # The word FAIL in quotes/string literals
+    'func.*Error',            # Error in function names
+    'err :?= ',               # Error variable assignments
+    'if err != nil',          # Error checking
+    'type.*Error',            # Error in type definitions
+    'errors\.'                # References to errors package
+)
+
+# First, look for actual test failures specifically
+$actualFailures = $false
+foreach ($pattern in $actualFailurePatterns) {
+    $matches = Select-String -Path $OutputFile -Pattern $pattern -Quiet
     if ($matches) {
-        $foundErrors = $true
-        Write-Host "Found error pattern: $pattern" -ForegroundColor Yellow
+        $actualFailures = $true
+        Write-Host "Found test failure pattern: $pattern" -ForegroundColor Yellow
+        break # One actual failure is enough to know tests failed
     }
 }
+
+# If we haven't found actual failures, look for the generic error patterns but exclude safe patterns
+if (-not $actualFailures) {
+    # Get the content of the file for more detailed analysis
+    $fileContent = Get-Content -Path $OutputFile -Raw
+    
+    foreach ($pattern in $errorPatterns) {
+        # Skip if this is a simple grep match without context
+        if (Select-String -InputObject $fileContent -Pattern $pattern -SimpleMatch -Quiet) {
+            # Check if any safe pattern applies before marking as error
+            $isSafeContext = $false
+            
+            foreach ($safePattern in $safePatterns) {
+                # Check the output for safe patterns with context
+                if (Select-String -InputObject $fileContent -Pattern $safePattern -Quiet) {
+                    # But make sure it's in the context of the error pattern (within 100 chars)
+                    $errorIndex = $fileContent.IndexOf($pattern)
+                    $contextStart = [Math]::Max(0, $errorIndex - 100)
+                    $contextLength = [Math]::Min(200, $fileContent.Length - $contextStart)
+                    $context = $fileContent.Substring($contextStart, $contextLength)
+                    
+                    if (Select-String -InputObject $context -Pattern $safePattern -Quiet) {
+                        $isSafeContext = $true
+                        break
+                    }
+                }
+            }
+            
+            # If we have a simple pass/fail indication in the output, use that instead of string matching
+            if ($fileContent -match "ok\s+\S+\s+[\d\.]+s") {
+                $isSafeContext = $true
+            }
+            
+            # If no safe pattern matched, treat as a real error
+            if (-not $isSafeContext) {
+                $foundErrors = $true
+                Write-Host "Found suspicious error pattern: $pattern" -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+# Also check the exit code - if non-zero, there's definitely a failure
+$foundErrors = $foundErrors -or $actualFailures -or ($overallExitCode -ne 0)
 
 # Show overall summary
 Write-Host "`nOverall Test Summary:" -ForegroundColor Cyan
@@ -206,7 +282,14 @@ Write-Host "  Duration: $(((Get-Date) - $startTime).TotalSeconds) seconds" -Fore
 if ($overallExitCode -eq 0 -and -not $foundErrors) {
     Write-Host "  Result: ALL TESTS PASSED" -ForegroundColor Green
 } else {
-    Write-Host "  Result: SOME TESTS FAILED" -ForegroundColor Red
+    # But respect the exit code above all else
+    if ($overallExitCode -ne 0) {
+        Write-Host "  Result: SOME TESTS FAILED (based on exit code)" -ForegroundColor Red
+    } elseif ($actualFailures) {
+        Write-Host "  Result: SOME TESTS FAILED (based on failure patterns)" -ForegroundColor Red
+    } elseif ($foundErrors) {
+        Write-Host "  Result: POTENTIAL ISSUES DETECTED (suspicious patterns)" -ForegroundColor Yellow
+    }
     Write-Host "  See $OutputFile for details" -ForegroundColor Red
 }
 

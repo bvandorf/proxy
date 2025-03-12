@@ -370,28 +370,35 @@ func TestProxyTLS(t *testing.T) {
 	<-proxyStarted
 	time.Sleep(100 * time.Millisecond)
 
-	// Connect to the proxy
+	// Connect to the proxy using TLS
 	t.Logf("Connecting to proxy at %s", proxy.ListenAddr)
-	conn, err := net.DialTimeout("tcp", proxy.ListenAddr, 1*time.Second)
-	if err != nil {
-		t.Fatalf("Failed to connect to proxy: %v", err)
+
+	// Create a TLS configuration that accepts any certificate
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true, // Accept self-signed certificate
 	}
-	defer conn.Close()
+
+	// Establish a TLS connection
+	tlsConn, err := tls.Dial("tcp", proxy.ListenAddr, tlsConfig)
+	if err != nil {
+		t.Fatalf("Failed to connect to proxy with TLS: %v", err)
+	}
+	defer tlsConn.Close()
 
 	// Send test data
 	testMessage := []byte("test tls message")
 	t.Logf("Sending message: %s", testMessage)
-	_, err = conn.Write(testMessage)
+	_, err = tlsConn.Write(testMessage)
 	if err != nil {
 		t.Fatalf("Failed to write to proxy: %v", err)
 	}
 
 	// Set a read deadline to avoid hanging
-	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	tlsConn.SetReadDeadline(time.Now().Add(1 * time.Second))
 
 	// Read response
 	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
+	n, err := tlsConn.Read(buf)
 	if err != nil {
 		t.Fatalf("Failed to read from proxy: %v", err)
 	}
@@ -399,9 +406,9 @@ func TestProxyTLS(t *testing.T) {
 	// Check the response
 	response := buf[:n]
 	t.Logf("Received response: %s", response)
-	// With TLS server, we just want to verify we got some data back
-	if n == 0 {
-		t.Errorf("Empty response received")
+
+	if !bytes.Equal(response, testMessage) {
+		t.Errorf("Response does not match sent message. Got %q, expected %q", response, testMessage)
 	}
 }
 
@@ -905,5 +912,592 @@ func TestCustomTargetTLSConfig(t *testing.T) {
 		t.Errorf("Empty response received")
 	} else {
 		t.Logf("Received response: %s", buf[:n])
+	}
+}
+
+// TestTargetClientCertificate tests the proxy's ability to use client certificates for target connections
+func TestTargetClientCertificate(t *testing.T) {
+	// Start a TLS server that requires client certificates
+	clientAuthServer, stopAuthServer := startMutualTLSServer(t)
+	defer stopAuthServer()
+
+	// Create a proxy with a unique port
+	port := getUniquePort()
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	config := NewProxyConfig(proxyAddr, clientAuthServer.URL[8:]) // Remove https:// prefix
+
+	// Use the client cert/key generated for testing
+	config.WithTargetClientCert("client.crt", "client.key")
+	// Accept the self-signed server cert
+	config.WithTargetTLSConfig(&tls.Config{
+		InsecureSkipVerify: true,
+	})
+
+	proxy := NewProxy(config)
+
+	// Start the proxy
+	proxyStarted := make(chan struct{})
+	go func() {
+		close(proxyStarted)
+		err := proxy.Start()
+		if err != nil && !IsClosedNetworkError(err) {
+			t.Logf("Proxy exited with error: %v", err)
+		}
+	}()
+
+	// Ensure the proxy is stopped at the end of the test
+	defer func() {
+		proxy.Stop()
+		time.Sleep(100 * time.Millisecond) // give time for cleanup
+	}()
+
+	// Wait for proxy to start
+	<-proxyStarted
+	time.Sleep(100 * time.Millisecond)
+
+	// Connect to the proxy
+	conn, err := net.DialTimeout("tcp", proxy.ListenAddr, 1*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect to proxy: %v", err)
+	}
+	defer conn.Close()
+
+	// Send test message
+	testMessage := []byte("test target client cert message")
+	t.Logf("Sending message: %s", testMessage)
+	_, err = conn.Write(testMessage)
+	if err != nil {
+		t.Fatalf("Failed to write to proxy: %v", err)
+	}
+
+	// Set a read deadline to avoid hanging
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+	// Read response
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Failed to read from proxy: %v", err)
+	}
+
+	// Check the response
+	response := buf[:n]
+	t.Logf("Received response: %s", response)
+
+	// The client auth server returns a message indicating authentication success
+	if !strings.Contains(string(response), "Authenticated as client") {
+		t.Errorf("Expected authentication success message, got: %s", response)
+	}
+}
+
+// startMutualTLSServer starts a TLS server that requires client certificate authentication
+// It returns the server URL and a function to stop the server
+func startMutualTLSServer(t *testing.T) (*httptest.Server, func()) {
+	// Load CA certificate
+	caCert, err := os.ReadFile("ca.crt")
+	if err != nil {
+		t.Fatalf("Failed to read CA certificate: %v", err)
+	}
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
+	// Load server certificate and key
+	serverCert, err := tls.LoadX509KeyPair("server.crt", "server.key")
+	if err != nil {
+		t.Fatalf("Failed to load server certificate: %v", err)
+	}
+
+	// Create TLS config with client auth
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientCAs:    caCertPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	}
+
+	// Create a TCP listener with a unique port for the TLS server
+	port := getUniquePort()
+	address := fmt.Sprintf("127.0.0.1:%d", port)
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		t.Fatalf("Failed to start TCP listener: %v", err)
+	}
+
+	// Start TLS server in a goroutine
+	serverStarted := make(chan struct{})
+	go func() {
+		close(serverStarted)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return // listener closed
+			}
+
+			// Handle each connection in a goroutine
+			go func(c net.Conn) {
+				defer c.Close()
+
+				// Create TLS connection
+				tlsConn := tls.Server(c, tlsConfig)
+				if err := tlsConn.Handshake(); err != nil {
+					t.Logf("TLS handshake failed: %v", err)
+					return
+				}
+
+				// Verify client cert
+				state := tlsConn.ConnectionState()
+				if len(state.PeerCertificates) == 0 {
+					t.Logf("No client certificates provided")
+					return
+				}
+
+				// Echo received data with authentication success message
+				buf := make([]byte, 1024)
+				n, err := tlsConn.Read(buf)
+				if err != nil {
+					t.Logf("Failed to read from client: %v", err)
+					return
+				}
+
+				clientMsg := buf[:n]
+				responseMsg := fmt.Sprintf("SUCCESS: Authenticated as client. Received: %s", clientMsg)
+				_, err = tlsConn.Write([]byte(responseMsg))
+				if err != nil {
+					t.Logf("Failed to write to client: %v", err)
+				}
+			}(conn)
+		}
+	}()
+
+	// Wait for server to start
+	<-serverStarted
+
+	// Create a dummy http server just for the URL structure
+	dummy := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	dummy.Close() // We don't actually need it running
+
+	// Create a mock URL with our actual server address
+	serverURL := strings.Replace(dummy.URL, dummy.Listener.Addr().String(), address, 1)
+
+	// Return a dummy server object with our address and cleanup function
+	mock := &httptest.Server{URL: serverURL}
+
+	return mock, func() {
+		listener.Close()
+	}
+}
+
+// TestInsecureClientAuth tests the proxy's ability to accept any client certificate
+func TestInsecureClientAuth(t *testing.T) {
+	// Create a proxy with a unique port
+	port := getUniquePort()
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	config := NewProxyConfig(proxyAddr, "localhost:9999") // Target doesn't matter for this test
+
+	// Generate a self-signed cert for testing
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("Failed to generate self-signed certificate: %v", err)
+	}
+
+	// Extract cert and key PEM
+	certPEM := getCertificatePEM(cert)
+	keyPEM := getPrivateKeyPEM(cert.PrivateKey.(*rsa.PrivateKey))
+
+	// Create temp files for the certificate and key
+	certFile, err := os.CreateTemp("", "cert*.pem")
+	if err != nil {
+		t.Fatalf("Failed to create temp cert file: %v", err)
+	}
+	defer os.Remove(certFile.Name())
+
+	keyFile, err := os.CreateTemp("", "key*.pem")
+	if err != nil {
+		t.Fatalf("Failed to create temp key file: %v", err)
+	}
+	defer os.Remove(keyFile.Name())
+
+	// Write cert and key to files
+	if _, err := certFile.Write(certPEM); err != nil {
+		t.Fatalf("Failed to write cert to file: %v", err)
+	}
+	certFile.Close()
+
+	if _, err := keyFile.Write(keyPEM); err != nil {
+		t.Fatalf("Failed to write key to file: %v", err)
+	}
+	keyFile.Close()
+
+	// Configure TLS with client auth but make it insecure
+	config.WithTLS(certFile.Name(), keyFile.Name())
+	config.WithClientAuth("", certFile.Name(), keyFile.Name()) // Empty CA = insecure mode
+
+	proxy := NewProxy(config)
+
+	// Verify client auth is set to VerifyClientCertIfGiven, not RequireAndVerifyClientCert
+	if proxy.clientTLSConfig == nil {
+		t.Fatalf("Client TLS config is nil")
+	}
+
+	// Check that we're using RequestClientCert for insecure mode
+	if proxy.clientTLSConfig.ClientAuth != tls.RequestClientCert {
+		t.Errorf("Expected ClientAuth to be RequestClientCert (insecure mode), got %v", proxy.clientTLSConfig.ClientAuth)
+	}
+
+	t.Log("InsecureClientAuth correctly configured")
+}
+
+// TestSendCustomResponse tests the SendCustomResponse method
+func TestSendCustomResponse(t *testing.T) {
+	// Start a test server
+	serverAddr, stopServer, _ := startTestServer(t, false)
+	defer stopServer()
+
+	// Create a proxy with a unique port
+	port := getUniquePort()
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	config := NewProxyConfig(proxyAddr, serverAddr)
+	proxy := NewProxy(config)
+
+	// Create a custom message handler
+	customResponse := []byte("CUSTOM_RESPONSE_DATA")
+	proxy.ClientToServerHandler = func(data []byte) ([]byte, bool) {
+		// If we receive a specific message, send custom response and stop processing
+		if bytes.Equal(data, []byte("TRIGGER_CUSTOM_RESPONSE")) {
+			proxy.SendCustomResponse(customResponse)
+			return nil, false // Don't forward to target
+		}
+		// Otherwise, proceed normally
+		return data, true
+	}
+
+	// Start the proxy
+	go func() {
+		err := proxy.Start()
+		if err != nil && !IsClosedNetworkError(err) {
+			t.Logf("Proxy exited with error: %v", err)
+		}
+	}()
+
+	// Give the proxy time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Make sure to stop the proxy at the end of the test
+	defer func() {
+		proxy.Stop()
+		time.Sleep(100 * time.Millisecond)
+	}()
+
+	// Connect to the proxy
+	conn, err := net.DialTimeout("tcp", proxy.ListenAddr, 1*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect to proxy: %v", err)
+	}
+	defer conn.Close()
+
+	// Send the trigger message
+	triggerMsg := []byte("TRIGGER_CUSTOM_RESPONSE")
+	t.Logf("Sending trigger message: %s", triggerMsg)
+	_, err = conn.Write(triggerMsg)
+	if err != nil {
+		t.Fatalf("Failed to write to proxy: %v", err)
+	}
+
+	// Set a read deadline to avoid hanging
+	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+
+	// Read response
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Failed to read from proxy: %v", err)
+	}
+
+	// Check the response
+	response := buf[:n]
+	t.Logf("Received response: %s", response)
+
+	// Verify we got the custom response
+	if !bytes.Equal(response, customResponse) {
+		t.Errorf("Expected custom response %q, got %q", customResponse, response)
+	}
+
+	// Now try a normal request to make sure regular proxying still works
+	normalMsg := []byte("NORMAL_REQUEST")
+	t.Logf("Sending normal message: %s", normalMsg)
+	_, err = conn.Write(normalMsg)
+	if err != nil {
+		t.Fatalf("Failed to write normal request to proxy: %v", err)
+	}
+
+	// Read response from the normal request
+	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	n, err = conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Failed to read normal response from proxy: %v", err)
+	}
+
+	// Verify normal response contains our original message (echo server)
+	normalResponse := buf[:n]
+	t.Logf("Received normal response: %s", normalResponse)
+
+	if !bytes.Contains(normalResponse, normalMsg) {
+		t.Errorf("Normal response should contain the request message")
+	}
+}
+
+// TestSendCustomServerRequest tests the SendCustomServerRequest method
+func TestSendCustomServerRequest(t *testing.T) {
+	// Start a test server that echoes data
+	serverAddr, stopServer, _ := startTestServer(t, false)
+	defer stopServer()
+
+	// Create a proxy with a unique port
+	port := getUniquePort()
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	config := NewProxyConfig(proxyAddr, serverAddr)
+	proxy := NewProxy(config)
+
+	// Start the proxy
+	go func() {
+		err := proxy.Start()
+		if err != nil && !IsClosedNetworkError(err) {
+			t.Logf("Proxy exited with error: %v", err)
+		}
+	}()
+
+	// Give the proxy time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Make sure to stop the proxy at the end of the test
+	defer func() {
+		proxy.Stop()
+		time.Sleep(100 * time.Millisecond)
+	}()
+
+	// Create a custom handler to demonstrate request/response interception and modification
+	proxy.ClientToServerHandler = func(data []byte) ([]byte, bool) {
+		if bytes.Equal(data, []byte("NORMAL_REQUEST")) {
+			// Test normal request without connection reuse
+			serverRequest := []byte("CUSTOM_SERVER_REQUEST")
+			t.Logf("Testing normal request without connection reuse: %s", serverRequest)
+
+			// Send custom request to server without connection reuse
+			serverResponse, err := proxy.SendCustomServerRequest(serverRequest, false)
+			if err != nil {
+				t.Logf("Error sending custom request: %v", err)
+				// Send error message to client
+				proxy.SendCustomResponse([]byte(fmt.Sprintf("ERROR: %v", err)))
+				return nil, false // Don't forward the original request
+			}
+
+			// Send the response to the client
+			t.Logf("Got response from server: %s", serverResponse)
+			proxy.SendCustomResponse([]byte(fmt.Sprintf("RESPONSE: %s", serverResponse)))
+			return nil, false // Don't forward the original request
+		} else if bytes.Equal(data, []byte("CONNECTION_REUSE_TEST")) {
+			// Test with connection reuse
+			t.Logf("Testing connection reuse functionality")
+
+			// 1. First request with reuse=true (should create a new connection)
+			serverRequest1 := []byte("FIRST_REQUEST")
+			t.Logf("Sending first request with reuse=true: %s", serverRequest1)
+			response1, err := proxy.SendCustomServerRequest(serverRequest1, true)
+			if err != nil {
+				t.Logf("Error sending first request: %v", err)
+				proxy.SendCustomResponse([]byte(fmt.Sprintf("ERROR1: %v", err)))
+				return nil, false
+			}
+			t.Logf("First response: %s", response1)
+
+			// 2. Second request with reuse=true (should attempt to reuse the connection)
+			// But since isTargetConnInUse is true (we're in the middle of a client connection handler)
+			// it should create a new connection
+			serverRequest2 := []byte("SECOND_REQUEST")
+			t.Logf("Sending second request with reuse=true: %s", serverRequest2)
+			response2, err := proxy.SendCustomServerRequest(serverRequest2, true)
+			if err != nil {
+				t.Logf("Error sending second request: %v", err)
+				proxy.SendCustomResponse([]byte(fmt.Sprintf("ERROR2: %v", err)))
+				return nil, false
+			}
+			t.Logf("Second response: %s", response2)
+
+			// Combine the responses
+			combinedResponse := append([]byte("RESPONSE1: "), response1...)
+			combinedResponse = append(combinedResponse, []byte("\nRESPONSE2: ")...)
+			combinedResponse = append(combinedResponse, response2...)
+
+			t.Logf("Combined responses: %s", combinedResponse)
+			proxy.SendCustomResponse(combinedResponse)
+			return nil, false // Don't forward the original request
+		}
+
+		// For other requests, pass through normally
+		return data, true
+	}
+
+	// Test 1: Normal request without connection reuse
+	t.Run("NormalRequest", func(t *testing.T) {
+		// Connect to the proxy
+		conn, err := net.DialTimeout("tcp", proxy.ListenAddr, 1*time.Second)
+		if err != nil {
+			t.Fatalf("Failed to connect to proxy: %v", err)
+		}
+		defer conn.Close()
+
+		// Send the normal request message
+		triggerMsg := []byte("NORMAL_REQUEST")
+		t.Logf("Sending normal request message: %s", triggerMsg)
+		_, err = conn.Write(triggerMsg)
+		if err != nil {
+			t.Fatalf("Failed to write to proxy: %v", err)
+		}
+
+		// Set a read deadline to avoid hanging
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+		// Read response
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("Failed to read from proxy: %v", err)
+		}
+
+		// Check the response
+		response := buf[:n]
+		t.Logf("Received response: %s", response)
+		if !bytes.Contains(response, []byte("RESPONSE:")) {
+			t.Errorf("Expected response containing 'RESPONSE:', got: %s", response)
+		}
+	})
+
+	// Test 2: Connection reuse test
+	t.Run("ConnectionReuseTest", func(t *testing.T) {
+		// Connect to the proxy
+		conn, err := net.DialTimeout("tcp", proxy.ListenAddr, 1*time.Second)
+		if err != nil {
+			t.Fatalf("Failed to connect to proxy: %v", err)
+		}
+		defer conn.Close()
+
+		// Send the connection reuse test message
+		triggerMsg := []byte("CONNECTION_REUSE_TEST")
+		t.Logf("Sending connection reuse test message: %s", triggerMsg)
+		_, err = conn.Write(triggerMsg)
+		if err != nil {
+			t.Fatalf("Failed to write to proxy: %v", err)
+		}
+
+		// Set a read deadline to avoid hanging
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+		// Read response
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("Failed to read from proxy: %v", err)
+		}
+
+		// Check the response
+		response := buf[:n]
+		t.Logf("Received response: %s", response)
+		if !bytes.Contains(response, []byte("RESPONSE1:")) || !bytes.Contains(response, []byte("RESPONSE2:")) {
+			t.Errorf("Expected response containing both 'RESPONSE1:' and 'RESPONSE2:', got: %s", response)
+		}
+	})
+}
+
+// TestConnectionReuseDirectly tests the SendCustomServerRequest method with connection reuse
+func TestConnectionReuseDirectly(t *testing.T) {
+	// Start a test server that echoes data
+	serverAddr, stopServer, _ := startTestServer(t, false)
+	defer stopServer()
+
+	// Create a proxy with a unique port
+	port := getUniquePort()
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	config := NewProxyConfig(proxyAddr, serverAddr)
+	proxy := NewProxy(config)
+
+	// Start the proxy
+	go func() {
+		err := proxy.Start()
+		if err != nil && !IsClosedNetworkError(err) {
+			t.Logf("Proxy exited with error: %v", err)
+		}
+	}()
+
+	// Give the proxy time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Make sure to stop the proxy at the end of the test
+	defer func() {
+		proxy.Stop()
+		time.Sleep(100 * time.Millisecond)
+	}()
+
+	// Test multiple requests with connection reuse enabled
+	// The function should handle connection reuse or fallback to creating new connections as needed
+	for i := 1; i <= 3; i++ {
+		requestMsg := []byte(fmt.Sprintf("REQUEST_%d", i))
+		t.Logf("Sending request %d with reuse=true: %s", i, requestMsg)
+
+		response, err := proxy.SendCustomServerRequest(requestMsg, true)
+		if err != nil {
+			t.Fatalf("Failed to send request %d: %v", i, err)
+		}
+
+		t.Logf("Received response %d: %s", i, response)
+
+		// Verify the response matches the request (echo server should return the same data)
+		if !bytes.Equal(response, requestMsg) {
+			t.Errorf("Response %d doesn't match request: got %s, expected %s", i, response, requestMsg)
+		}
+	}
+}
+
+// TestDefaultPortFromListener tests that the target address correctly inherits the port from the listener
+func TestDefaultPortFromListener(t *testing.T) {
+	// Test cases
+	testCases := []struct {
+		name           string
+		listenerAddr   string
+		targetAddr     string
+		expectedTarget string
+	}{
+		{
+			name:           "Target with port specified",
+			listenerAddr:   "localhost:8080",
+			targetAddr:     "example.com:9090",
+			expectedTarget: "example.com:9090", // Port should not change
+		},
+		{
+			name:           "Target without port",
+			listenerAddr:   "localhost:8080",
+			targetAddr:     "example.com",
+			expectedTarget: "example.com:8080", // Should inherit listener port
+		},
+		{
+			name:           "Both IPv4 addresses",
+			listenerAddr:   "127.0.0.1:8080",
+			targetAddr:     "192.168.1.1",
+			expectedTarget: "192.168.1.1:8080", // Should inherit listener port
+		},
+		{
+			name:           "IPv6 listener address",
+			listenerAddr:   "[::1]:8080",
+			targetAddr:     "example.com",
+			expectedTarget: "example.com:8080", // Should inherit listener port
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := NewProxyConfig(tc.listenerAddr, tc.targetAddr)
+
+			if config.TargetAddress != tc.expectedTarget {
+				t.Errorf("Expected target address %s, got %s", tc.expectedTarget, config.TargetAddress)
+			}
+		})
 	}
 }
