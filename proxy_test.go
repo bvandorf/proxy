@@ -772,3 +772,138 @@ func TestClientCertAuthIntegration(t *testing.T) {
 		}
 	})
 }
+
+// TestCustomTargetTLSConfig tests the proxy with custom target TLS configuration and SNI
+func TestCustomTargetTLSConfig(t *testing.T) {
+	// Start a TLS test server
+	serverAddr, stopServer, _ := startTestServer(t, true)
+	defer stopServer()
+
+	// Parse the host and port
+	host, _, err := net.SplitHostPort(serverAddr)
+	if err != nil {
+		t.Fatalf("Failed to split host and port: %v", err)
+	}
+
+	// Create a proxy with a unique port
+	port := getUniquePort()
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	config := NewProxyConfig(proxyAddr, serverAddr)
+
+	// Generate certificates for the client-to-proxy connection
+	serverCert, err := generateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("Failed to generate self-signed certificate: %v", err)
+	}
+
+	// Extract cert and key PEM
+	certPEM := getCertificatePEM(serverCert)
+	keyPEM := getPrivateKeyPEM(serverCert.PrivateKey.(*rsa.PrivateKey))
+
+	// Create temp files for the certificate and key
+	certFile, err := os.CreateTemp("", "cert*.pem")
+	if err != nil {
+		t.Fatalf("Failed to create temp cert file: %v", err)
+	}
+	defer os.Remove(certFile.Name())
+
+	keyFile, err := os.CreateTemp("", "key*.pem")
+	if err != nil {
+		t.Fatalf("Failed to create temp key file: %v", err)
+	}
+	defer os.Remove(keyFile.Name())
+
+	// Write cert and key to files
+	if _, err := certFile.Write(certPEM); err != nil {
+		t.Fatalf("Failed to write cert to file: %v", err)
+	}
+	certFile.Close()
+
+	if _, err := keyFile.Write(keyPEM); err != nil {
+		t.Fatalf("Failed to write key to file: %v", err)
+	}
+	keyFile.Close()
+
+	// Create custom TLS config for target
+	targetTLSConfig := &tls.Config{
+		InsecureSkipVerify: true, // For testing only
+		ServerName:         host, // Set hostname for SNI
+	}
+
+	// Configure TLS for the proxy
+	config.WithClientTLS(certFile.Name(), keyFile.Name())
+	config.WithTargetTLSConfig(targetTLSConfig)
+
+	// Create the proxy
+	proxy := NewProxy(config)
+
+	// Verify the TLS configuration was set correctly
+	if proxy.tlsConfig == nil {
+		t.Fatalf("Target TLS configuration was not set")
+	}
+
+	// Check if the ServerName is set correctly for SNI
+	if proxy.tlsConfig.ServerName != host {
+		t.Errorf("Custom TLS config ServerName not set correctly, expected %s, got %s",
+			host, proxy.tlsConfig.ServerName)
+	}
+
+	// Start the proxy in a goroutine
+	proxyStarted := make(chan struct{})
+	go func() {
+		close(proxyStarted)
+		err := proxy.Start()
+		if err != nil && !IsClosedNetworkError(err) {
+			t.Logf("Proxy exited with error: %v", err)
+		}
+	}()
+
+	// Make sure to stop the proxy at the end of the test
+	defer func() {
+		proxy.Stop()
+		time.Sleep(100 * time.Millisecond) // give time for cleanup
+	}()
+
+	// Wait for proxy to start
+	<-proxyStarted
+	time.Sleep(100 * time.Millisecond)
+
+	// Connect to the proxy
+	// We'll establish a TLS connection since our proxy is configured for client TLS
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true, // Accept the self-signed cert for testing
+	}
+	dialer := &net.Dialer{
+		Timeout: 2 * time.Second,
+	}
+	conn, err := tls.DialWithDialer(dialer, "tcp", proxy.ListenAddr, tlsConfig)
+	if err != nil {
+		t.Fatalf("Failed to connect to proxy with TLS: %v", err)
+	}
+	defer conn.Close()
+
+	// Send test data
+	testMessage := []byte("test custom tls config message")
+	t.Logf("Sending message: %s", testMessage)
+	_, err = conn.Write(testMessage)
+	if err != nil {
+		t.Fatalf("Failed to write to proxy: %v", err)
+	}
+
+	// Set a read deadline to avoid hanging
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+	// Read response
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+
+	// We don't strictly need to check the response data, just that we got some response
+	if err != nil {
+		t.Fatalf("Failed to read from proxy: %v", err)
+	}
+	if n == 0 {
+		t.Errorf("Empty response received")
+	} else {
+		t.Logf("Received response: %s", buf[:n])
+	}
+}

@@ -25,9 +25,10 @@ type ProxyConfig struct {
 	TargetTLS bool // Whether the proxy should use TLS to connect to target
 
 	// TLS configuration
-	ServerCertFile string // Path to server certificate file for client-proxy TLS
-	ServerKeyFile  string // Path to server key file for client-proxy TLS
-	CACertFile     string // Path to CA certificate file for client verification
+	ServerCertFile  string      // Path to server certificate file for client-proxy TLS
+	ServerKeyFile   string      // Path to server key file for client-proxy TLS
+	CACertFile      string      // Path to CA certificate file for client verification
+	TargetTLSConfig *tls.Config // Custom TLS configuration for proxy-to-target
 
 	// Client authentication
 	ClientAuth bool // Whether client certificate authentication is required
@@ -59,6 +60,14 @@ func (c *ProxyConfig) WithClientTLS(serverCertFile, serverKeyFile string) *Proxy
 // WithTargetTLS configures the proxy to use TLS for proxy-to-target connections
 func (c *ProxyConfig) WithTargetTLS() *ProxyConfig {
 	c.TargetTLS = true
+	return c
+}
+
+// WithTargetTLSConfig configures the proxy to use a specific TLS configuration
+// for proxy-to-target connections
+func (c *ProxyConfig) WithTargetTLSConfig(config *tls.Config) *ProxyConfig {
+	c.TargetTLS = true
+	c.TargetTLSConfig = config
 	return c
 }
 
@@ -117,11 +126,16 @@ func NewProxy(config *ProxyConfig) *Proxy {
 
 	// Apply target TLS configuration if specified
 	if config.TargetTLS {
-		// Configure proxy-to-target TLS
-		targetTLSConfig := &tls.Config{
-			InsecureSkipVerify: true, // Note: In production, this should be false
+		// Use custom TLS config if provided, otherwise create a default one
+		if config.TargetTLSConfig != nil {
+			proxy.tlsConfig = config.TargetTLSConfig
+		} else {
+			// Configure proxy-to-target TLS with a default config
+			targetTLSConfig := &tls.Config{
+				InsecureSkipVerify: true, // Note: In production, this should be false
+			}
+			proxy.tlsConfig = targetTLSConfig
 		}
-		proxy.tlsConfig = targetTLSConfig
 	}
 
 	// Apply client TLS and authentication settings if specified
@@ -275,9 +289,25 @@ func (p *Proxy) handleConnection(clientConn net.Conn) error {
 		Timeout: p.config.DialTimeout,
 	}
 
+	// Extract hostname from target address for SNI if needed
+	host, _, err := net.SplitHostPort(p.TargetAddr)
+	if err != nil {
+		// If splitting fails, use the whole target address
+		host = p.TargetAddr
+	}
+
 	// If using TLS to connect to target
 	if p.tlsConfig != nil {
-		targetConn, err = tls.DialWithDialer(dialer, "tcp", p.TargetAddr, p.tlsConfig)
+		// Create a copy of the TLS config to ensure we don't modify the original
+		tlsConfig := p.tlsConfig.Clone()
+
+		// Set the ServerName for SNI if not already set
+		if tlsConfig.ServerName == "" {
+			tlsConfig.ServerName = host
+		}
+
+		// Establish TLS connection to target
+		targetConn, err = tls.DialWithDialer(dialer, "tcp", p.TargetAddr, tlsConfig)
 	} else {
 		targetConn, err = dialer.Dial("tcp", p.TargetAddr)
 	}
