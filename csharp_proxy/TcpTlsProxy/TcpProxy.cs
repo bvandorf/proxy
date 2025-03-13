@@ -18,7 +18,7 @@ namespace TcpTlsProxy
     /// Delegate for processing data between client and server
     /// Returns the processed data and a boolean indicating whether to forward the data
     /// </summary>
-    public delegate (byte[] data, bool forward) DataProcessor(byte[] data);
+    public delegate (byte[] data, bool forward) DataProcessor(string clientId, byte[] data);
 
     /// <summary>
     /// TCP/TLS proxy implementation
@@ -31,6 +31,13 @@ namespace TcpTlsProxy
         private readonly CancellationTokenSource _internalCts = new CancellationTokenSource();
         private readonly List<Task> _activeTasks = new List<Task>();
         private readonly object _tasksLock = new object();
+        
+        // Dictionary to track active client connections in standalone mode
+        private readonly Dictionary<string, ClientConnection> _activeClients = new Dictionary<string, ClientConnection>();
+        private readonly object _clientsLock = new object();
+        
+        // Flag to indicate whether we're in standalone mode
+        private bool _standaloneMode = false;
 
         /// <summary>
         /// Handler for processing data from client to server
@@ -414,6 +421,10 @@ namespace TcpTlsProxy
             TcpClient? targetTcpClient = null;
             Stream? targetStream = null;
             
+            // Get client ID for data processing
+            var clientEndPoint = (IPEndPoint)client.Client.RemoteEndPoint!;
+            string clientId = $"{clientEndPoint.Address}:{clientEndPoint.Port}";
+            
             try
             {
                 // Set up client TLS if enabled
@@ -437,8 +448,6 @@ namespace TcpTlsProxy
                     await sslStream.AuthenticateAsServerAsync(options, cancellationToken).ConfigureAwait(false);
                     
                     _logger.Log($"TLS handshake completed with cipher: {sslStream.SslProtocol}");
-
-                    // Replace the client stream with the SSL stream
                     clientStream = sslStream;
                 }
                 
@@ -480,7 +489,6 @@ namespace TcpTlsProxy
                     SslClientAuthenticationOptions options = new SslClientAuthenticationOptions
                     {
                         TargetHost = targetHost,
-                        RemoteCertificateValidationCallback = _config.ServerCertValidationCallback,
                         EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13
                     };
                     
@@ -498,10 +506,10 @@ namespace TcpTlsProxy
                 
                 // Start proxying data between client and target
                 Task clientToTarget = ProxyDataAsync(
-                    clientStream, targetStream, ClientToServerHandler, cancellationToken, "client", "target");
+                    clientId, clientStream, targetStream, ClientToServerHandler, cancellationToken, "client", "target");
                 
                 Task targetToClient = ProxyDataAsync(
-                    targetStream, clientStream, ServerToClientHandler, cancellationToken, "target", "client");
+                    clientId, targetStream, clientStream, ServerToClientHandler, cancellationToken, "target", "client");
                 
                 // Wait for either direction to complete (or error)
                 await Task.WhenAny(clientToTarget, targetToClient).ConfigureAwait(false);
@@ -511,13 +519,6 @@ namespace TcpTlsProxy
                 
                 // Wait for both directions to complete
                 await Task.WhenAll(clientToTarget, targetToClient).ConfigureAwait(false);
-
-                // Set TCP keepalive time to 30 seconds
-                byte[] keepAliveValues = new byte[12];
-                BitConverter.GetBytes(1).CopyTo(keepAliveValues, 0); // Enable keepalive
-                BitConverter.GetBytes(30000).CopyTo(keepAliveValues, 4); // 30 second timeout
-                BitConverter.GetBytes(1000).CopyTo(keepAliveValues, 8); // 1 second interval
-                targetTcpClient.Client.IOControl(IOControlCode.KeepAliveValues, keepAliveValues, null);
             }
             catch (Exception ex)
             {
@@ -546,45 +547,40 @@ namespace TcpTlsProxy
         /// Proxies data between two streams
         /// </summary>
         private async Task ProxyDataAsync(
-            Stream source, 
-            Stream destination, 
-            DataProcessor? dataProcessor, 
+            string clientId,
+            Stream source,
+            Stream destination,
+            DataProcessor? dataProcessor,
             CancellationToken cancellationToken,
             string sourceName,
             string destName)
         {
-            byte[] buffer = new byte[8192];
+            const int TlsRecordHeaderSize = 5;  // TLS record header size
+            const int MaxTlsRecordSize = 16384 + TlsRecordHeaderSize;  // Maximum TLS record size plus header
+            byte[] buffer = new byte[MaxTlsRecordSize];
             
             try
             {
-                _logger.Log($"Client → Target: Transferring data");
-                _logger.Log($"Target → Client: Transferring data");
-                _logger.Log($"Client stream closed: {source.CanRead}");
-                _logger.Log($"Target stream closed: {destination.CanRead}");
+                _logger.Log($"Starting data transfer from {sourceName} to {destName}");
                 
-                // Instead of immediately breaking on zero reads, try multiple times
-                int zeroReadsCount = 0;
                 while (!cancellationToken.IsCancellationRequested)
                 {
-                    int bytesRead = await source.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                    int bytesRead;
+                    try
+                    {
+                        bytesRead = await source.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                    }
+                    catch (IOException ex) when (ex.InnerException is ObjectDisposedException)
+                    {
+                        _logger.Log($"Stream from {sourceName} was closed");
+                        break;
+                    }
                     
                     if (bytesRead == 0)
                     {
-                        zeroReadsCount++;
-                        // Only consider the stream closed after multiple zero reads
-                        if (zeroReadsCount >= 3)
-                        {
-                            _logger.Log("Stream appears to be closed after multiple zero reads");
-                            break;
-                        }
-                        
-                        // Wait a bit before retry
-                        await Task.Delay(100, cancellationToken);
-                        continue;
+                        _logger.Log($"End of stream from {sourceName}");
+                        break;
                     }
-                    
-                    // Reset counter on successful read
-                    zeroReadsCount = 0;
                     
                     byte[] data = new byte[bytesRead];
                     Array.Copy(buffer, data, bytesRead);
@@ -593,14 +589,22 @@ namespace TcpTlsProxy
                     bool forwardData = true;
                     if (dataProcessor != null)
                     {
-                        (data, forwardData) = dataProcessor(data);
+                        (data, forwardData) = dataProcessor(clientId, data);
                     }
                     
                     // Forward data if not intercepted
                     if (forwardData && data.Length > 0)
                     {
-                        await destination.WriteAsync(data, 0, data.Length, cancellationToken).ConfigureAwait(false);
-                        await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
+                        try
+                        {
+                            await destination.WriteAsync(data, 0, data.Length, cancellationToken);
+                            await destination.FlushAsync(cancellationToken);
+                        }
+                        catch (IOException ex) when (ex.InnerException is ObjectDisposedException)
+                        {
+                            _logger.Log($"Stream to {destName} was closed");
+                            break;
+                        }
                     }
                 }
             }
@@ -613,7 +617,340 @@ namespace TcpTlsProxy
                 else
                 {
                     _logger.LogError($"Error proxying data from {sourceName} to {destName}", ex);
+                    throw;
                 }
+            }
+        }
+
+        /// <summary>
+        /// Starts the proxy in standalone mode without forwarding to a target
+        /// </summary>
+        /// <param name="cancellationToken">Cancellation token</param>
+        /// <returns>Task representing the asynchronous operation</returns>
+        public async Task StartStandaloneAsync(CancellationToken cancellationToken)
+        {
+            if (ClientToServerHandler == null)
+            {
+                throw new InvalidOperationException("ClientToServerHandler must be set before starting in standalone mode");
+            }
+            
+            _standaloneMode = true;
+            
+            try
+            {
+                // Set up client-side TLS if enabled
+                SetupClientTls();
+                
+                // Parse listener address
+                string[] parts = _config.ListenerAddress.Split(':');
+                if (parts.Length != 2 || !int.TryParse(parts[1], out int port))
+                {
+                    throw new ArgumentException($"Invalid listener address: {_config.ListenerAddress}");
+                }
+                
+                // Create and start listener
+                _listener = new TcpListener(IPAddress.Parse(parts[0]), port);
+                _listener.Start();
+                
+                _logger.Log($"Standalone proxy listening on {_config.ListenerAddress}");
+                
+                // Set up a linked token source to handle both external and internal cancellation
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                    cancellationToken, _internalCts.Token);
+                
+                while (!linkedCts.Token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        // Accept client connection
+                        var client = await _listener.AcceptTcpClientAsync().ConfigureAwait(false);
+                        client.NoDelay = true; // Disable Nagle's algorithm for better performance
+                        
+                        var clientEndPoint = (IPEndPoint)client.Client.RemoteEndPoint!;
+                        string clientId = $"{clientEndPoint.Address}:{clientEndPoint.Port}";
+                        _logger.Log($"Accepted connection from {clientId}");
+                        
+                        // Start processing client connection in a background task
+                        var task = HandleStandaloneClientAsync(clientId, client, linkedCts.Token);
+                        
+                        lock (_tasksLock)
+                        {
+                            _activeTasks.Add(task);
+                        }
+                        
+                        // Clean up completed tasks to avoid memory leak
+                        CleanupCompletedTasks();
+                    }
+                    catch (OperationCanceledException) when (linkedCts.Token.IsCancellationRequested)
+                    {
+                        // Normal cancellation
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError("Error accepting client connection", ex);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError("Fatal error in standalone proxy", ex);
+                throw;
+            }
+            finally
+            {
+                // Stop the listener
+                _listener?.Stop();
+                _logger.Log("Standalone proxy stopped");
+                
+                // Wait for all active tasks to complete
+                await WaitForActiveTasksAsync().ConfigureAwait(false);
+                
+                // Clear active clients
+                lock (_clientsLock)
+                {
+                    _activeClients.Clear();
+                }
+            }
+        }
+        
+        /// <summary>
+        /// Handles a client connection in standalone mode
+        /// </summary>
+        private async Task HandleStandaloneClientAsync(string clientId, TcpClient client, CancellationToken cancellationToken)
+        {
+            Stream clientStream = client.GetStream();
+            
+            try
+            {
+                // Set up client TLS if enabled
+                if (_config.ClientTls)
+                {
+                    _logger.Log($"Setting up TLS for client {clientId}");
+                    
+                    SslStream sslStream = new SslStream(
+                        clientStream,
+                        false,
+                        _config.ClientCertValidationCallback);
+                    
+                    // Server authentication mode
+                    SslServerAuthenticationOptions options = new SslServerAuthenticationOptions
+                    {
+                        ServerCertificate = _config.ServerCertificate,
+                        ClientCertificateRequired = _config.ClientAuth,
+                        EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13
+                    };
+                    
+                    await sslStream.AuthenticateAsServerAsync(options, cancellationToken).ConfigureAwait(false);
+                    
+                    _logger.Log($"TLS handshake completed for client {clientId} with cipher: {sslStream.SslProtocol}");
+                    clientStream = sslStream;
+                }
+                
+                // Store the client connection for later use
+                var clientConnection = new ClientConnection(clientId, client, clientStream);
+                lock (_clientsLock)
+                {
+                    _activeClients[clientId] = clientConnection;
+                }
+                
+                _logger.Log($"Client {clientId} registered for standalone mode");
+                
+                // Start processing incoming data
+                const int TlsRecordHeaderSize = 5;  // TLS record header size
+                const int MaxTlsRecordSize = 16384 + TlsRecordHeaderSize;  // Maximum TLS record size plus header
+                byte[] buffer = new byte[MaxTlsRecordSize];
+                
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    int bytesRead;
+                    try
+                    {
+                        bytesRead = await clientStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                    }
+                    catch (IOException ex) when (ex.InnerException is ObjectDisposedException)
+                    {
+                        _logger.Log($"Stream from client {clientId} was closed");
+                        break;
+                    }
+                    
+                    if (bytesRead == 0)
+                    {
+                        _logger.Log($"End of stream from client {clientId}");
+                        break;
+                    }
+                    
+                    byte[] data = new byte[bytesRead];
+                    Array.Copy(buffer, data, bytesRead);
+                    
+                    _logger.Log($"Received {bytesRead} bytes from client {clientId}");
+                    
+                    // Process the data using the ClientToServerHandler
+                    if (ClientToServerHandler != null)
+                    {
+                        var (processedData, forward) = ClientToServerHandler(clientId, data);
+                        
+                        // If the handler indicates to forward the data, then we send it back to the same client
+                        // This maintains the same behavior as the original StandaloneDataHandler
+                        if (forward && processedData.Length > 0)
+                        {
+                            await SendToClientAsync(clientId, processedData, cancellationToken);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
+                {
+                    _logger.Log($"Connection handling for client {clientId} cancelled");
+                }
+                else
+                {
+                    _logger.LogError($"Error handling client {clientId} connection", ex);
+                }
+            }
+            finally
+            {
+                // Remove client from active clients
+                lock (_clientsLock)
+                {
+                    _activeClients.Remove(clientId);
+                }
+                
+                // Clean up resources
+                clientStream.Dispose();
+                client.Dispose();
+                
+                _logger.Log($"Connection with client {clientId} closed");
+            }
+        }
+        
+        /// <summary>
+        /// Sends data to a specific client in standalone mode
+        /// </summary>
+        /// <param name="clientId">ID of the client to send data to</param>
+        /// <param name="data">Data to send</param>
+        /// <param name="cancellationToken">Cancellation token</param>
+        /// <returns>True if the data was sent successfully, false if the client is not found</returns>
+        public async Task<bool> SendToClientAsync(string clientId, byte[] data, CancellationToken cancellationToken = default)
+        {
+            if (!_standaloneMode)
+            {
+                throw new InvalidOperationException("SendToClientAsync can only be used in standalone mode");
+            }
+            
+            ClientConnection? clientConnection;
+            lock (_clientsLock)
+            {
+                if (!_activeClients.TryGetValue(clientId, out clientConnection))
+                {
+                    _logger.Log($"Client {clientId} not found for sending data");
+                    return false;
+                }
+            }
+            
+            try
+            {
+                await clientConnection.Stream.WriteAsync(data, 0, data.Length, cancellationToken);
+                await clientConnection.Stream.FlushAsync(cancellationToken);
+                
+                _logger.Log($"Sent {data.Length} bytes to client {clientId}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error sending data to client {clientId}", ex);
+                return false;
+            }
+        }
+        
+        /// <summary>
+        /// Broadcasts data to all connected clients in standalone mode
+        /// </summary>
+        /// <param name="data">Data to broadcast</param>
+        /// <param name="cancellationToken">Cancellation token</param>
+        /// <returns>Number of clients the data was successfully sent to</returns>
+        public async Task<int> BroadcastAsync(byte[] data, CancellationToken cancellationToken = default)
+        {
+            if (!_standaloneMode)
+            {
+                throw new InvalidOperationException("BroadcastAsync can only be used in standalone mode");
+            }
+            
+            List<ClientConnection> clients;
+            lock (_clientsLock)
+            {
+                clients = new List<ClientConnection>(_activeClients.Values);
+            }
+            
+            int successCount = 0;
+            
+            foreach (var client in clients)
+            {
+                try
+                {
+                    await client.Stream.WriteAsync(data, 0, data.Length, cancellationToken);
+                    await client.Stream.FlushAsync(cancellationToken);
+                    successCount++;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError($"Error broadcasting to client {client.Id}", ex);
+                }
+            }
+            
+            _logger.Log($"Broadcasted {data.Length} bytes to {successCount} clients");
+            return successCount;
+        }
+        
+        /// <summary>
+        /// Gets a list of currently connected client IDs in standalone mode
+        /// </summary>
+        /// <returns>List of client IDs</returns>
+        public List<string> GetConnectedClients()
+        {
+            if (!_standaloneMode)
+            {
+                throw new InvalidOperationException("GetConnectedClients can only be used in standalone mode");
+            }
+            
+            lock (_clientsLock)
+            {
+                return new List<string>(_activeClients.Keys);
+            }
+        }
+        
+        /// <summary>
+        /// Disconnects a specific client in standalone mode
+        /// </summary>
+        /// <param name="clientId">ID of the client to disconnect</param>
+        /// <returns>True if the client was disconnected, false if the client was not found</returns>
+        public bool DisconnectClient(string clientId)
+        {
+            if (!_standaloneMode)
+            {
+                throw new InvalidOperationException("DisconnectClient can only be used in standalone mode");
+            }
+            
+            ClientConnection? clientConnection;
+            lock (_clientsLock)
+            {
+                if (!_activeClients.TryGetValue(clientId, out clientConnection))
+                {
+                    return false;
+                }
+            }
+            
+            try
+            {
+                clientConnection.Client.Close();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error disconnecting client {clientId}", ex);
+                return false;
             }
         }
 
@@ -671,6 +1008,23 @@ namespace TcpTlsProxy
         public void SetCACertificateForTesting(X509Certificate2 certificate)
         {
             _config.CACertificate = certificate;
+        }
+
+        /// <summary>
+        /// Class to track client connections in standalone mode
+        /// </summary>
+        private class ClientConnection
+        {
+            public string Id { get; }
+            public TcpClient Client { get; }
+            public Stream Stream { get; }
+            
+            public ClientConnection(string id, TcpClient client, Stream stream)
+            {
+                Id = id;
+                Client = client;
+                Stream = stream;
+            }
         }
     }
 } 

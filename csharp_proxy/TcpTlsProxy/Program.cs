@@ -201,7 +201,7 @@ namespace TcpTlsProxy
                     // Set up data handlers for verbose logging
                     if (verbose || !string.IsNullOrEmpty(logFile))
                     {
-                        proxy.ClientToServerHandler = (data) =>
+                        proxy.ClientToServerHandler = (clientId, data) =>
                         {
                             logger.Log($"Client to server: {data.Length} bytes");
                             if (verbose)
@@ -212,7 +212,7 @@ namespace TcpTlsProxy
                             return (data, true);
                         };
 
-                        proxy.ServerToClientHandler = (data) =>
+                        proxy.ServerToClientHandler = (clientId, data) =>
                         {
                             logger.Log($"Server to client: {data.Length} bytes");
                             if (verbose)

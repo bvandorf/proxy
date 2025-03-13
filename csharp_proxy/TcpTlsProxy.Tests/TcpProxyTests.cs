@@ -64,8 +64,8 @@ namespace TcpTlsProxy.Tests
             var proxy = new TcpProxy(_config, _mockLogger.Object);
             
             // Act
-            DataProcessor clientToServerHandler = (data) => (data, true);
-            DataProcessor serverToClientHandler = (data) => (data, true);
+            DataProcessor clientToServerHandler = (clientId, data) => (data, true);
+            DataProcessor serverToClientHandler = (clientId, data) => (data, true);
             
             proxy.ClientToServerHandler = clientToServerHandler;
             proxy.ServerToClientHandler = serverToClientHandler;

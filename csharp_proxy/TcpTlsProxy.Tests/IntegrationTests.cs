@@ -89,7 +89,7 @@ namespace TcpTlsProxy.Tests
                 var proxy = new TcpProxy(_config, _logger);
                 
                 // Configure data handlers to modify data
-                proxy.ClientToServerHandler = (data) =>
+                proxy.ClientToServerHandler = (clientId, data) =>
                 {
                     // Convert to uppercase
                     string text = Encoding.UTF8.GetString(data);
@@ -97,7 +97,7 @@ namespace TcpTlsProxy.Tests
                     return (Encoding.UTF8.GetBytes(modified), true);
                 };
                 
-                proxy.ServerToClientHandler = (data) =>
+                proxy.ServerToClientHandler = (clientId, data) =>
                 {
                     // Add a prefix
                     string text = Encoding.UTF8.GetString(data);
@@ -185,7 +185,7 @@ namespace TcpTlsProxy.Tests
             var proxy = new TcpProxy(_config, _logger);
             
             // Configure client-to-server handler to intercept certain requests
-            proxy.ClientToServerHandler = (data) =>
+            proxy.ClientToServerHandler = (clientId, data) =>
             {
                 string text = Encoding.UTF8.GetString(data);
                 
