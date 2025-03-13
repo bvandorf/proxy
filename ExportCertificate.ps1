@@ -12,6 +12,9 @@
 .EXAMPLE
     .\ExportCertificate.ps1 -Thumbprint "1234567890ABCDEF1234567890ABCDEF12345678"
     Exports the certificate with the specified thumbprint
+.EXAMPLE
+    .\ExportCertificate.ps1 -SearchTerm "example.com" -CertStoreLocation "LocalMachine"
+    Searches for certificates in the Local Machine store instead of Current User
 .PARAMETER SearchTerm
     Text to search for in certificate subjects or common names
 .PARAMETER Thumbprint
@@ -20,6 +23,8 @@
     Directory where certificate files will be saved (default: current directory)
 .PARAMETER OpenSSLPath
     Path to OpenSSL executable (tries to find it automatically if not specified)
+.PARAMETER CertStoreLocation
+    The certificate store location to search in (CurrentUser or LocalMachine)
 .NOTES
     Requires administrative privileges to access the certificate store
     Requires OpenSSL to be installed for PEM conversion
@@ -37,7 +42,11 @@ param (
     [string]$OutputPath = ".",
     
     [Parameter(Mandatory=$false)]
-    [string]$OpenSSLPath
+    [string]$OpenSSLPath,
+    
+    [Parameter(Mandatory=$false)]
+    [ValidateSet("CurrentUser", "LocalMachine")]
+    [string]$CertStoreLocation = "CurrentUser"
 )
 
 # Handle the help/info action
@@ -48,8 +57,8 @@ if ($Action -eq "help") {
     Write-Host
     Write-Host "Usage:" -ForegroundColor Yellow
     Write-Host "  .\ExportCertificate.ps1 [help]"
-    Write-Host "  .\ExportCertificate.ps1 search [SearchTerm] [-OutputPath <path>] [-OpenSSLPath <path>]"
-    Write-Host "  .\ExportCertificate.ps1 thumbprint <ThumbprintValue> [-OutputPath <path>] [-OpenSSLPath <path>]"
+    Write-Host "  .\ExportCertificate.ps1 search [SearchTerm] [-OutputPath <path>] [-OpenSSLPath <path>] [-CertStoreLocation <CurrentUser|LocalMachine>]"
+    Write-Host "  .\ExportCertificate.ps1 thumbprint <ThumbprintValue> [-OutputPath <path>] [-OpenSSLPath <path>] [-CertStoreLocation <CurrentUser|LocalMachine>]"
     Write-Host 
     Write-Host "Examples:" -ForegroundColor Yellow
     Write-Host "  # Show this help information:"
@@ -66,6 +75,9 @@ if ($Action -eq "help") {
     Write-Host
     Write-Host "  # Export to a specific path:"
     Write-Host "  .\ExportCertificate.ps1 search example.com -OutputPath C:\Certs"
+    Write-Host
+    Write-Host "  # Search in Local Machine store instead of Current User:"
+    Write-Host "  .\ExportCertificate.ps1 search example.com -CertStoreLocation LocalMachine"
     Write-Host
     Write-Host "For detailed help:"
     Write-Host "  Get-Help .\ExportCertificate.ps1 -Full"
@@ -215,24 +227,28 @@ Write-Host "Using OpenSSL from: $OpenSSLPath" -ForegroundColor Green
 
 # Search for certificates
 try {
+    # Build the certificate store path
+    $certStorePath = "Cert:\$CertStoreLocation\My"
+    Write-Host "Searching in certificate store: $certStorePath" -ForegroundColor Cyan
+    
     if ($Action -eq "thumbprint") {
         # Search by thumbprint (exact match)
         Write-Host "Searching for certificate with thumbprint: $Value" -ForegroundColor Cyan
-        $certs = Get-ChildItem -Path Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $Value }
+        $certs = Get-ChildItem -Path $certStorePath | Where-Object { $_.Thumbprint -eq $Value }
     }
     elseif ($Action -eq "search") {
         # Search by subject or common name if value provided
         if ($Value) {
             Write-Host "Searching for certificates matching: $Value" -ForegroundColor Cyan
-            $certs = Get-ChildItem -Path Cert:\CurrentUser\My | Where-Object { 
+            $certs = Get-ChildItem -Path $certStorePath | Where-Object { 
                 $_.Subject -like "*$Value*" -or
                 $_.Subject.Contains("CN=$Value") -or
                 ($_.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Subject Alternative Name" }) -like "*$Value*"
             }
         } else {
             # List all certificates
-            Write-Host "Listing all certificates in the Personal store:" -ForegroundColor Cyan
-            $certs = Get-ChildItem -Path Cert:\CurrentUser\My
+            Write-Host "Listing all certificates in the $CertStoreLocation Personal store:" -ForegroundColor Cyan
+            $certs = Get-ChildItem -Path $certStorePath
         }
     }
     
