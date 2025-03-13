@@ -124,6 +124,13 @@ namespace TcpTlsProxy
             
             try
             {
+                // If the certificate has already been set directly (e.g. for testing), use it
+                if (_config.ServerCertificate != null)
+                {
+                    _logger.Log("Using pre-configured server certificate");
+                    return;
+                }
+                
                 // Load server certificate from Windows store
                 if (string.IsNullOrEmpty(_config.ServerCertSubject))
                 {
@@ -256,7 +263,11 @@ namespace TcpTlsProxy
                 };
                 
                 // Load client certificate if specified
-                if (!string.IsNullOrEmpty(_config.ClientCertSubject))
+                if (_config.ClientCertificate != null)
+                {
+                    _logger.Log("Using pre-configured client certificate");
+                }
+                else if (!string.IsNullOrEmpty(_config.ClientCertSubject))
                 {
                     _logger.Log($"Loading client certificate from Windows store: {_config.ClientCertSubject}");
                     
@@ -426,6 +437,8 @@ namespace TcpTlsProxy
                     await sslStream.AuthenticateAsServerAsync(options, cancellationToken).ConfigureAwait(false);
                     
                     _logger.Log($"TLS handshake completed with cipher: {sslStream.SslProtocol}");
+
+                    // Replace the client stream with the SSL stream
                     clientStream = sslStream;
                 }
                 
@@ -498,6 +511,13 @@ namespace TcpTlsProxy
                 
                 // Wait for both directions to complete
                 await Task.WhenAll(clientToTarget, targetToClient).ConfigureAwait(false);
+
+                // Set TCP keepalive time to 30 seconds
+                byte[] keepAliveValues = new byte[12];
+                BitConverter.GetBytes(1).CopyTo(keepAliveValues, 0); // Enable keepalive
+                BitConverter.GetBytes(30000).CopyTo(keepAliveValues, 4); // 30 second timeout
+                BitConverter.GetBytes(1000).CopyTo(keepAliveValues, 8); // 1 second interval
+                targetTcpClient.Client.IOControl(IOControlCode.KeepAliveValues, keepAliveValues, null);
             }
             catch (Exception ex)
             {
@@ -537,16 +557,34 @@ namespace TcpTlsProxy
             
             try
             {
+                _logger.Log($"Client → Target: Transferring data");
+                _logger.Log($"Target → Client: Transferring data");
+                _logger.Log($"Client stream closed: {source.CanRead}");
+                _logger.Log($"Target stream closed: {destination.CanRead}");
+                
+                // Instead of immediately breaking on zero reads, try multiple times
+                int zeroReadsCount = 0;
                 while (!cancellationToken.IsCancellationRequested)
                 {
-                    // Read data from source
-                    int bytesRead = await source.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
+                    int bytesRead = await source.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
                     
                     if (bytesRead == 0)
                     {
-                        // End of stream
-                        break;
+                        zeroReadsCount++;
+                        // Only consider the stream closed after multiple zero reads
+                        if (zeroReadsCount >= 3)
+                        {
+                            _logger.Log("Stream appears to be closed after multiple zero reads");
+                            break;
+                        }
+                        
+                        // Wait a bit before retry
+                        await Task.Delay(100, cancellationToken);
+                        continue;
                     }
+                    
+                    // Reset counter on successful read
+                    zeroReadsCount = 0;
                     
                     byte[] data = new byte[bytesRead];
                     Array.Copy(buffer, data, bytesRead);
@@ -606,6 +644,33 @@ namespace TcpTlsProxy
                 _logger.LogError("Error sending custom response", ex);
                 throw;
             }
+        }
+
+        /// <summary>
+        /// Sets the server certificate directly for testing purposes
+        /// </summary>
+        /// <param name="certificate">Server certificate</param>
+        public void SetServerCertificateForTesting(X509Certificate2 certificate)
+        {
+            _config.ServerCertificate = certificate;
+        }
+        
+        /// <summary>
+        /// Sets the client certificate directly for testing purposes
+        /// </summary>
+        /// <param name="certificate">Client certificate</param>
+        public void SetClientCertificateForTesting(X509Certificate2 certificate)
+        {
+            _config.ClientCertificate = certificate;
+        }
+        
+        /// <summary>
+        /// Sets the CA certificate directly for testing purposes
+        /// </summary>
+        /// <param name="certificate">CA certificate</param>
+        public void SetCACertificateForTesting(X509Certificate2 certificate)
+        {
+            _config.CACertificate = certificate;
         }
     }
 } 

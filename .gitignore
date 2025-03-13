@@ -20,6 +20,70 @@
 # Go workspace file
 go.work
 
+# Test output
 test_output.txt
+
+# Certificates and keys
 *.crt
 *.key
+
+### C# and .NET Core ###
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio files
+.vs/
+*.user
+*.userosscache
+*.suo
+*.userprefs
+*.pidb
+*.svclog
+*.scc
+*.psess
+*.vsp
+*.vspx
+*.dbmdl
+*.dbproj.schemaview
+*.jfm
+*.pfx
+*.publishsettings
+
+# ReSharper files
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+# NuGet Packages
+*.nupkg
+*.snupkg
+# The packages folder can be ignored because of Package Restore
+**/[Pp]ackages/*
+# except build/, which is used as an MSBuild target.
+!**/[Pp]ackages/build/
+
+# JetBrains Rider
+.idea/
+*.sln.iml
+
+# Miscellaneous
+*.swp
+*.bak
+*~
+.DS_Store
+*.txt
+*.log
