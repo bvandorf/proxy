@@ -40,7 +40,7 @@ namespace TcpTlsProxy.Examples
             _proxy = new TcpProxy(proxyConfig, logger);
 
             // Create the WebSocket data source (your actual implementation would go here)
-            _webSocketDataSource = new ExternalWebSocketDataSource();
+            _webSocketDataSource = new ExternalWebSocketDataSource("wss://www.example.com");
 
             // Set up event handlers
             _webSocketDataSource.MessageReceived += OnWebSocketMessageReceived;
@@ -57,7 +57,7 @@ namespace TcpTlsProxy.Examples
         public async Task StartAsync()
         {
             // Connect to the WebSocket service
-            await _webSocketDataSource.ConnectAsync("wss://your-websocket-service.com");
+            await _webSocketDataSource.ConnectAsync(_webSocketDataSource.TargetAddress);
 
             // Start the proxy in standalone mode
             _ = Task.Run(async () =>
@@ -144,6 +144,12 @@ namespace TcpTlsProxy.Examples
         public event EventHandler<string> MessageReceived;
         public event EventHandler<Exception> ErrorOccurred;
         public event EventHandler ConnectionClosed;
+        public string TargetAddress { get; set; }
+
+        public ExternalWebSocketDataSource(string targetAddress)
+        {
+            TargetAddress = targetAddress;
+        }
 
         /// <summary>
         /// Simulates connecting to a WebSocket service

@@ -9,6 +9,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
+using TcpTlsProxy.Protocols;
 
 namespace TcpTlsProxy
 {
@@ -206,8 +207,8 @@ namespace TcpTlsProxy
                             logger.Log($"Client to server: {data.Length} bytes");
                             if (verbose)
                             {
-                                logger.Log($"Data: {System.Text.Encoding.ASCII.GetString(data)}");
-                                logger.Log($"Hex: {BitConverter.ToString(data).Replace("-", " ")}");
+                                // Use the DataLogger for comprehensive logging
+                                DataLogger.LogData(logger, "Client to Server", data, clientId);
                             }
                             return (data, true);
                         };
@@ -217,8 +218,8 @@ namespace TcpTlsProxy
                             logger.Log($"Server to client: {data.Length} bytes");
                             if (verbose)
                             {
-                                logger.Log($"Data: {System.Text.Encoding.ASCII.GetString(data)}");
-                                logger.Log($"Hex: {BitConverter.ToString(data).Replace("-", " ")}");
+                                // Use the DataLogger for comprehensive logging
+                                DataLogger.LogData(logger, "Server to Client", data, clientId);
                             }
                             return (data, true);
                         };

@@ -45,7 +45,7 @@ namespace TcpTlsProxy
         /// Log a message to console and log file (if specified)
         /// </summary>
         /// <param name="message">The message to log</param>
-        public void Log(string message)
+        public virtual void Log(string message)
         {
             string formattedMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}";
             
@@ -74,7 +74,7 @@ namespace TcpTlsProxy
         /// </summary>
         /// <param name="message">The error message to log</param>
         /// <param name="ex">Optional exception to include in the log</param>
-        public void LogError(string message, Exception ex = null)
+        public virtual void LogError(string message, Exception ex = null)
         {
             string errorMessage = $"ERROR: {message}";
             if (ex != null)

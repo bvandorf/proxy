@@ -11,6 +11,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using TcpTlsProxy.Protocols;
 
 namespace TcpTlsProxy
 {
@@ -451,6 +452,66 @@ namespace TcpTlsProxy
                     clientStream = sslStream;
                 }
                 
+                // Wait for initial data from client before connecting to target
+                const int TlsRecordHeaderSize = 5;  // TLS record header size
+                const int MaxTlsRecordSize = 16384 + TlsRecordHeaderSize;  // Maximum TLS record size plus header
+                byte[] initialBuffer = new byte[MaxTlsRecordSize];
+                
+                _logger.Log("Waiting for initial data from client before connecting to target");
+                int initialBytesRead;
+                try
+                {
+                    initialBytesRead = await clientStream.ReadAsync(initialBuffer, 0, initialBuffer.Length, cancellationToken);
+                }
+                catch (IOException ex) when (ex.InnerException is ObjectDisposedException)
+                {
+                    _logger.Log("Client stream was closed before sending any data");
+                    return;
+                }
+                
+                if (initialBytesRead == 0)
+                {
+                    _logger.Log("Client disconnected without sending any data");
+                    return;
+                }
+                
+                byte[] initialData = new byte[initialBytesRead];
+                Array.Copy(initialBuffer, initialData, initialBytesRead);
+                
+                // Log the initial data
+                DataLogger.LogData(_logger, "Initial data from client", initialData, clientId);
+                
+                // Process initial data if processor is available
+                bool forwardInitialData = true;
+                byte[] processedInitialData = initialData;
+                if (ClientToServerHandler != null)
+                {
+                    (processedInitialData, forwardInitialData) = ClientToServerHandler(clientId, initialData);
+                    
+                    // If data was modified, log the changes
+                    if (!AreEqual(processedInitialData, initialData))
+                    {
+                        _logger.Log("Initial data was modified by client-to-server processor");
+                        DataLogger.LogData(_logger, "Modified initial data", processedInitialData, clientId);
+                    }
+                    
+                    if (!forwardInitialData)
+                    {
+                        _logger.Log("Initial data was intercepted and will not be forwarded to target");
+                        
+                        // If data is not to be forwarded, we can optionally respond and close the connection
+                        if (processedInitialData.Length > 0)
+                        {
+                            await clientStream.WriteAsync(processedInitialData, 0, processedInitialData.Length, cancellationToken);
+                            await clientStream.FlushAsync(cancellationToken);
+                            _logger.Log("Sent response to client without connecting to target");
+                        }
+                        
+                        return;
+                    }
+                }
+                
+                // Now connect to target since we have initial data to forward
                 // Parse target address
                 string[] targetParts = _config.TargetAddress.Split(':');
                 string targetHost = targetParts[0];
@@ -504,7 +565,15 @@ namespace TcpTlsProxy
                     targetStream = sslStream;
                 }
                 
-                // Start proxying data between client and target
+                // Forward the initial data to the target if needed
+                if (forwardInitialData && processedInitialData.Length > 0)
+                {
+                    await targetStream.WriteAsync(processedInitialData, 0, processedInitialData.Length, cancellationToken);
+                    await targetStream.FlushAsync(cancellationToken);
+                    _logger.Log($"Forwarded initial {processedInitialData.Length} bytes to target");
+                }
+                
+                // Start proxying data between client and target for subsequent communications
                 Task clientToTarget = ProxyDataAsync(
                     clientId, clientStream, targetStream, ClientToServerHandler, cancellationToken, "client", "target");
                 
@@ -585,11 +654,22 @@ namespace TcpTlsProxy
                     byte[] data = new byte[bytesRead];
                     Array.Copy(buffer, data, bytesRead);
                     
+                    // Log the raw data before processing
+                    DataLogger.LogData(_logger, $"Received from {sourceName}", data, clientId);
+                    
                     // Process data if processor is available
                     bool forwardData = true;
+                    byte[] originalData = data; // Save original data for logging if modified
                     if (dataProcessor != null)
                     {
                         (data, forwardData) = dataProcessor(clientId, data);
+                        
+                        // If data was modified, log the changes
+                        if (!AreEqual(data, originalData))
+                        {
+                            _logger.Log($"Data was modified by {sourceName}-to-{destName} processor");
+                            DataLogger.LogData(_logger, "Modified data", data, clientId);
+                        }
                     }
                     
                     // Forward data if not intercepted
@@ -599,12 +679,19 @@ namespace TcpTlsProxy
                         {
                             await destination.WriteAsync(data, 0, data.Length, cancellationToken);
                             await destination.FlushAsync(cancellationToken);
+                            
+                            // Log forwarded data
+                            _logger.Log($"Forwarded {data.Length} bytes from {sourceName} to {destName}");
                         }
                         catch (IOException ex) when (ex.InnerException is ObjectDisposedException)
                         {
                             _logger.Log($"Stream to {destName} was closed");
                             break;
                         }
+                    }
+                    else if (!forwardData)
+                    {
+                        _logger.Log($"Data from {sourceName} was intercepted and not forwarded to {destName}");
                     }
                 }
             }
@@ -620,6 +707,26 @@ namespace TcpTlsProxy
                     throw;
                 }
             }
+        }
+
+        /// <summary>
+        /// Compare two byte arrays for equality
+        /// </summary>
+        private bool AreEqual(byte[] a, byte[] b)
+        {
+            if (a == null || b == null)
+                return a == b;
+                
+            if (a.Length != b.Length)
+                return false;
+                
+            for (int i = 0; i < a.Length; i++)
+            {
+                if (a[i] != b[i])
+                    return false;
+            }
+            
+            return true;
         }
 
         /// <summary>
@@ -783,18 +890,33 @@ namespace TcpTlsProxy
                     byte[] data = new byte[bytesRead];
                     Array.Copy(buffer, data, bytesRead);
                     
-                    _logger.Log($"Received {bytesRead} bytes from client {clientId}");
+                    // Log raw incoming data
+                    DataLogger.LogData(_logger, "Received from client", data, clientId);
                     
                     // Process the data using the ClientToServerHandler
                     if (ClientToServerHandler != null)
                     {
+                        byte[] originalData = data; // Save original data for comparison
                         var (processedData, forward) = ClientToServerHandler(clientId, data);
                         
-                        // If the handler indicates to forward the data, then we send it back to the same client
-                        // This maintains the same behavior as the original StandaloneDataHandler
+                        // If data was modified, log the changes
+                        if (!AreEqual(processedData, originalData))
+                        {
+                            _logger.Log($"Data from client {clientId} was modified by handler");
+                            DataLogger.LogData(_logger, "Modified data", processedData, clientId);
+                        }
+                        
+                        // If the handler indicates to forward the data, then we send it back to the client
                         if (forward && processedData.Length > 0)
                         {
                             await SendToClientAsync(clientId, processedData, cancellationToken);
+                            
+                            // Log that data was sent back
+                            _logger.Log($"Response data sent back to client {clientId}");
+                        }
+                        else if (!forward)
+                        {
+                            _logger.Log($"Data from client {clientId} was intercepted and not forwarded");
                         }
                     }
                 }
@@ -852,6 +974,9 @@ namespace TcpTlsProxy
             
             try
             {
+                // Log the data being sent
+                DataLogger.LogData(_logger, "Sending to client", data, clientId);
+                
                 await clientConnection.Stream.WriteAsync(data, 0, data.Length, cancellationToken);
                 await clientConnection.Stream.FlushAsync(cancellationToken);
                 
@@ -883,6 +1008,9 @@ namespace TcpTlsProxy
             {
                 clients = new List<ClientConnection>(_activeClients.Values);
             }
+            
+            // Log the broadcast data once
+            DataLogger.LogData(_logger, "Broadcasting to all clients", data, "broadcast");
             
             int successCount = 0;
             
