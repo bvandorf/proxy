@@ -6,6 +6,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.IO.Pipelines;
 using CsProxyTools.Base;
 using CsProxyTools.Interfaces;
+using CsProxyTools.Helpers;
 using Microsoft.Extensions.Logging;
 using System.Text;
 
@@ -16,7 +17,7 @@ public class TlsClient : BaseConnection, ITlsClient
     private readonly string _host;
     private readonly int _port;
     private readonly bool _validateCertificate;
-    private Socket _socket;
+    private Socket? _socket;
     private readonly X509Certificate2? _clientCertificate;
     private NetworkStream? _stream;
     private SslStream? _sslStream;
@@ -270,140 +271,137 @@ public class TlsClient : BaseConnection, ITlsClient
         
         while (retryCount <= maxRetries)
         {
-            try
+            // Configure SSL options with enhanced parameters
+            var sslOptions = new SslClientAuthenticationOptions
             {
-                // Configure SSL options with enhanced parameters
-                var sslOptions = new SslClientAuthenticationOptions
+                TargetHost = _host,
+                // Support both TLS 1.2 and TLS 1.3 for better compatibility
+                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                RemoteCertificateValidationCallback = ValidateServerCertificate,
+                AllowRenegotiation = true,
+                EncryptionPolicy = EncryptionPolicy.RequireEncryption,
+                CertificateRevocationCheckMode = X509RevocationMode.NoCheck
+            };
+            
+            // If client certificate is provided, add it to the options
+            if (_clientCertificate != null)
+            {
+                _logger.LogDebug("TlsClient: Using client certificate for authentication: {Thumbprint}", 
+                    _clientCertificate.Thumbprint);
+                
+                var clientCertificateCollection = new X509CertificateCollection
                 {
-                    TargetHost = _host,
-                    // Support both TLS 1.2 and TLS 1.3 for better compatibility
-                    EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-                    RemoteCertificateValidationCallback = ValidateServerCertificate,
-                    AllowRenegotiation = true,
-                    EncryptionPolicy = EncryptionPolicy.RequireEncryption,
-                    CertificateRevocationCheckMode = X509RevocationMode.NoCheck
+                    _clientCertificate
                 };
                 
-                // If client certificate is provided, add it to the options
-                if (_clientCertificate != null)
-                {
-                    _logger.LogDebug("TlsClient: Using client certificate for authentication: {Thumbprint}", 
-                        _clientCertificate.Thumbprint);
-                    
-                    var clientCertificateCollection = new X509CertificateCollection
-                    {
-                        _clientCertificate
-                    };
-                    
-                    sslOptions.ClientCertificates = clientCertificateCollection;
-                }
-                
-                _logger.LogDebug("TlsClient: Beginning SSL handshake with {Host} using TLS 1.2/1.3 (Attempt {Attempt}/{MaxAttempts})", 
-                    _host, retryCount + 1, maxRetries + 1);
-                
+                sslOptions.ClientCertificates = clientCertificateCollection;
+            }
+            
+            _logger.LogDebug("TlsClient: Beginning SSL handshake with {Host} using TLS 1.2/1.3 (Attempt {Attempt}/{MaxAttempts})", 
+                _host, retryCount + 1, maxRetries + 1);
+
+            try
+            {
                 // Use a timeout for the SSL handshake
                 using var handshakeTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_cancellationTokenSource.Token);
                 handshakeTimeoutCts.CancelAfter(_handshakeTimeout);
                 
                 _logger.LogDebug("TlsClient: Starting SSL handshake with timeout of {Seconds} seconds", _handshakeTimeout.TotalSeconds);
                 
-                try 
+                await _sslStream.AuthenticateAsClientAsync(sslOptions, handshakeTimeoutCts.Token);
+                
+                // If we get here, authentication succeeded
+                _logger.LogDebug("TlsClient: SSL handshake completed successfully");
+                _logger.LogDebug("TlsClient: Negotiated Protocol: {Protocol}", _sslStream.SslProtocol);
+                _logger.LogDebug("TlsClient: Cipher: {Cipher} ({Strength} bit)", _sslStream.CipherAlgorithm, _sslStream.CipherStrength);
+                
+                // If client certificate was used, log that information
+                if (_clientCertificate != null && _sslStream.LocalCertificate != null)
                 {
-                    await _sslStream.AuthenticateAsClientAsync(sslOptions, handshakeTimeoutCts.Token);
-                    
-                    // If we get here, authentication succeeded
-                    _logger.LogDebug("TlsClient: SSL handshake completed successfully");
-                    _logger.LogDebug("TlsClient: Negotiated Protocol: {Protocol}", _sslStream.SslProtocol);
-                    _logger.LogDebug("TlsClient: Cipher: {Cipher} ({Strength} bit)", _sslStream.CipherAlgorithm, _sslStream.CipherStrength);
-                    
-                    // If client certificate was used, log that information
-                    if (_clientCertificate != null && _sslStream.LocalCertificate != null)
-                    {
-                        _logger.LogDebug("TlsClient: Client certificate was used for authentication");
-                    }
-                    
-                    // Log server certificate details for debugging
-                    if (_sslStream.RemoteCertificate != null)
-                    {
-                        _logger.LogDebug("TlsClient: Server certificate subject: {Subject}", _sslStream.RemoteCertificate.Subject);
-                        _logger.LogDebug("TlsClient: Server certificate issuer: {Issuer}", _sslStream.RemoteCertificate.Issuer);
-                        _logger.LogDebug("TlsClient: Server certificate valid from {ValidFrom} to {ValidTo}", 
-                            _sslStream.RemoteCertificate.GetEffectiveDateString(), 
-                            _sslStream.RemoteCertificate.GetExpirationDateString());
-                    }
-                    else
-                    {
-                        _logger.LogWarning("TlsClient: No server certificate available after successful handshake");
-                    }
-                    
-                    // Authentication successful, break the retry loop
-                    break;
+                    _logger.LogDebug("TlsClient: Client certificate was used for authentication");
                 }
-                catch (AuthenticationException authEx)
+                
+                // Log server certificate details for debugging
+                if (_sslStream.RemoteCertificate != null)
                 {
-                    lastException = authEx;
-                    _logger.LogError(authEx, "TlsClient: TLS authentication failed (Attempt {Attempt}/{MaxAttempts}): {Message}", 
-                        retryCount + 1, maxRetries + 1, authEx.Message);
+                    _logger.LogDebug("TlsClient: Server certificate subject: {Subject}", _sslStream.RemoteCertificate.Subject);
+                    _logger.LogDebug("TlsClient: Server certificate issuer: {Issuer}", _sslStream.RemoteCertificate.Issuer);
+                    _logger.LogDebug("TlsClient: Server certificate valid from {ValidFrom} to {ValidTo}", 
+                        _sslStream.RemoteCertificate.GetEffectiveDateString(), 
+                        _sslStream.RemoteCertificate.GetExpirationDateString());
+                }
+                else
+                {
+                    _logger.LogWarning("TlsClient: No server certificate available after successful handshake");
+                }
+                
+                // Authentication successful, break the retry loop
+                break;
+            }
+            catch (AuthenticationException authEx)
+            {
+                lastException = authEx;
+                _logger.LogError(authEx, "TlsClient: TLS authentication failed (Attempt {Attempt}/{MaxAttempts}): {Message}", 
+                    retryCount + 1, maxRetries + 1, authEx.Message);
+                
+                if (authEx.InnerException != null)
+                {
+                    _logger.LogError("TlsClient: Inner exception - {InnerType}: {InnerMessage}", 
+                        authEx.InnerException.GetType().Name, authEx.InnerException.Message);
+                }
+                
+                // Try to get more specific TLS error information if available
+                _logger.LogError("TlsClient: Detailed TLS error diagnostics:");
+                _logger.LogError("TlsClient: - Target host: {Host}", _host);
+                _logger.LogError("TlsClient: - Enabled protocols: {Protocols}", sslOptions.EnabledSslProtocols);
+                _logger.LogError("TlsClient: - Certificate validation enabled: {Validation}", _validateCertificate);
+                
+                // Check if this might be a protocol version mismatch
+                if (authEx.Message.Contains("protocol") || 
+                    (authEx.InnerException?.Message?.Contains("protocol") ?? false))
+                {
+                    _logger.LogError("TlsClient: Possible TLS protocol version mismatch. Server might not support TLS 1.2/1.3");
                     
-                    if (authEx.InnerException != null)
+                    // If we have more retries left, we could try an older protocol version as a last resort
+                    if (retryCount == maxRetries - 1)
                     {
-                        _logger.LogError("TlsClient: Inner exception - {InnerType}: {InnerMessage}", 
-                            authEx.InnerException.GetType().Name, authEx.InnerException.Message);
-                    }
-                    
-                    // Try to get more specific TLS error information if available
-                    _logger.LogError("TlsClient: Detailed TLS error diagnostics:");
-                    _logger.LogError("TlsClient: - Target host: {Host}", _host);
-                    _logger.LogError("TlsClient: - Enabled protocols: {Protocols}", sslOptions.EnabledSslProtocols);
-                    _logger.LogError("TlsClient: - Certificate validation enabled: {Validation}", _validateCertificate);
-                    
-                    // Check if this might be a protocol version mismatch
-                    if (authEx.Message.Contains("protocol") || 
-                        (authEx.InnerException?.Message?.Contains("protocol") ?? false))
-                    {
-                        _logger.LogError("TlsClient: Possible TLS protocol version mismatch. Server might not support TLS 1.2/1.3");
-                        
-                        // If we have more retries left, we could try an older protocol version as a last resort
-                        if (retryCount == maxRetries - 1)
-                        {
-                            _logger.LogWarning("TlsClient: On final retry, will attempt with TLS 1.0/1.1 as fallback");
-                            // This would normally be set in the next iteration, but logging it here for clarity
-                        }
+                        _logger.LogWarning("TlsClient: On final retry, will attempt with TLS 1.0/1.1 as fallback");
+                        // This would normally be set in the next iteration, but logging it here for clarity
                     }
                 }
-                catch (OperationCanceledException) 
+            }
+            catch (OperationCanceledException) 
+            {
+                lastException = new TimeoutException($"SSL handshake timed out after {_handshakeTimeout.TotalSeconds} seconds");
+                _logger.LogWarning("TlsClient: SSL handshake timed out after {Seconds} seconds (Attempt {Attempt}/{MaxAttempts})", 
+                    _handshakeTimeout.TotalSeconds, retryCount + 1, maxRetries + 1);
+            }
+            catch (IOException ioEx)
+            {
+                lastException = ioEx;
+                _logger.LogWarning(ioEx, "TlsClient: IO error during SSL handshake (Attempt {Attempt}/{MaxAttempts}): {Message}", 
+                    retryCount + 1, maxRetries + 1, ioEx.Message);
+                
+                if (ioEx.InnerException != null)
                 {
-                    lastException = new TimeoutException($"SSL handshake timed out after {_handshakeTimeout.TotalSeconds} seconds");
-                    _logger.LogWarning("TlsClient: SSL handshake timed out after {Seconds} seconds (Attempt {Attempt}/{MaxAttempts})", 
-                        _handshakeTimeout.TotalSeconds, retryCount + 1, maxRetries + 1);
+                    _logger.LogError("TlsClient: Inner exception - {InnerType}: {InnerMessage}", 
+                        ioEx.InnerException.GetType().Name, ioEx.InnerException.Message);
                 }
-                catch (IOException ioEx)
+                
+                // Check if the underlying socket is still connected
+                bool isSocketConnected = _socket != null && _socket.Connected;
+                _logger.LogError("TlsClient: Socket connected status: {IsConnected}", isSocketConnected);
+            }
+            catch (Exception ex)
+            {
+                lastException = ex;
+                _logger.LogWarning(ex, "TlsClient: SSL handshake failed (Attempt {Attempt}/{MaxAttempts}): {Message}", 
+                    retryCount + 1, maxRetries + 1, ex.Message);
+                
+                if (ex.InnerException != null)
                 {
-                    lastException = ioEx;
-                    _logger.LogWarning(ioEx, "TlsClient: IO error during SSL handshake (Attempt {Attempt}/{MaxAttempts}): {Message}", 
-                        retryCount + 1, maxRetries + 1, ioEx.Message);
-                    
-                    if (ioEx.InnerException != null)
-                    {
-                        _logger.LogError("TlsClient: Inner exception - {InnerType}: {InnerMessage}", 
-                            ioEx.InnerException.GetType().Name, ioEx.InnerException.Message);
-                    }
-                    
-                    // Check if the underlying socket is still connected
-                    bool isSocketConnected = _socket != null && _socket.Connected;
-                    _logger.LogError("TlsClient: Socket connected status: {IsConnected}", isSocketConnected);
-                }
-                catch (Exception ex)
-                {
-                    lastException = ex;
-                    _logger.LogWarning(ex, "TlsClient: SSL handshake failed (Attempt {Attempt}/{MaxAttempts}): {Message}", 
-                        retryCount + 1, maxRetries + 1, ex.Message);
-                    
-                    if (ex.InnerException != null)
-                    {
-                        _logger.LogError("TlsClient: Inner exception - {InnerType}: {InnerMessage}", 
-                            ex.InnerException.GetType().Name, ex.InnerException.Message);
-                    }
+                    _logger.LogError("TlsClient: Inner exception - {InnerType}: {InnerMessage}", 
+                        ex.InnerException.GetType().Name, ex.InnerException.Message);
                 }
             }
             
@@ -412,9 +410,9 @@ public class TlsClient : BaseConnection, ITlsClient
             // If we've reached max retries, clean up and throw the last exception
             if (retryCount > maxRetries)
             {
-                _logger.LogError("TlsClient: SSL handshake failed after {MaxAttempts} attempts");
+                _logger.LogError("TlsClient: SSL handshake failed after {MaxAttempts} attempts", maxRetries + 1);
                 CleanupConnection();
-                throw lastException!;
+                throw lastException ?? new InvalidOperationException("SSL handshake failed with unknown error");
             }
             
             // Perform cleanup and retry with a new stream
@@ -602,23 +600,40 @@ public class TlsClient : BaseConnection, ITlsClient
         _logger.LogDebug("TlsClient: Starting read stream task");
         try
         {
-            // Use a larger buffer for TLS frames
-            var buffer = new byte[16384];
-            
-            while (!_cancellationTokenSource.Token.IsCancellationRequested && _sslStream != null)
+            // Create endpoint info string
+            string remoteEndpoint = "unknown";
+            if (_socket != null && _socket.Connected && _socket.RemoteEndPoint is System.Net.IPEndPoint ipEndPoint) 
             {
-                int bytesRead;
-                
-                try 
+                remoteEndpoint = $"{ipEndPoint.Address}:{ipEndPoint.Port}";
+            }
+            
+            var buffer = new byte[8192];
+            var readTimeout = TimeSpan.FromSeconds(30);
+
+            while (!_cancellationTokenSource.Token.IsCancellationRequested)
+            {
+                try
                 {
                     _logger.LogTrace("TlsClient: Reading from SSL stream");
                     
-                    // Use cancellation token but with a timeout per read operation
                     using var readTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_cancellationTokenSource.Token);
-                    readTimeoutCts.CancelAfter(TimeSpan.FromSeconds(30)); // 30 second timeout per read
+                    readTimeoutCts.CancelAfter(readTimeout);
                     
-                    bytesRead = await _sslStream.ReadAsync(buffer, 0, buffer.Length, readTimeoutCts.Token);
+                    var bytesRead = await _sslStream!.ReadAsync(buffer.AsMemory(), readTimeoutCts.Token);
+                    
                     _logger.LogTrace("TlsClient: Read {BytesRead} bytes from SSL stream", bytesRead);
+                    
+                    if (bytesRead == 0)
+                    {
+                        _logger.LogDebug("TlsClient: End of SSL stream reached (0 bytes read)");
+                        break;
+                    }
+                    
+                    // Process the data
+                    var memory = new ReadOnlyMemory<byte>(buffer, 0, bytesRead);
+                    _logger.LogDebug("TlsClient: Triggering DataReceived event for {BytesRead} bytes from {RemoteEndpoint}\n{DataPreview}", 
+                        bytesRead, remoteEndpoint, StringUtils.GetDataPreview(memory));
+                    OnDataReceived(memory, remoteEndpoint);
                 }
                 catch (OperationCanceledException)
                 {
@@ -656,20 +671,6 @@ public class TlsClient : BaseConnection, ITlsClient
                     _logger.LogError(ex, "TlsClient: Unexpected error during read");
                     break;
                 }
-                
-                if (bytesRead == 0) 
-                {
-                    _logger.LogDebug("TlsClient: End of SSL stream reached (0 bytes read)");
-                    break;
-                }
-
-                // Create a memory copy of the data to avoid buffer modification in callbacks
-                var data = new byte[bytesRead];
-                Buffer.BlockCopy(buffer, 0, data, 0, bytesRead);
-                var memory = new ReadOnlyMemory<byte>(data);
-                
-                _logger.LogDebug("TlsClient: Triggering DataReceived event for {BytesRead} bytes", bytesRead);
-                OnDataReceived(memory);
             }
             _logger.LogDebug("TlsClient: Read stream loop completed normally");
         }
@@ -727,79 +728,50 @@ public class TlsClient : BaseConnection, ITlsClient
     // Override the correct method from BaseConnection
     protected override async Task WriteDataAsync(ReadOnlyMemory<byte> data)
     {
-        if (_sslStream == null || !IsConnectionHealthy())
+        // Check connection state and attempt to reconnect if needed
+        if (!IsConnectionHealthy())
         {
             _logger.LogWarning("TlsClient: SSL connection is not healthy. Attempting to reconnect first.");
-            try {
-                await StopConnectionAsync(); // First clean up any existing connection
-                await StartConnectionAsync(); // Then establish a fresh connection
+            try
+            {
+                await StartConnectionAsync();
                 // Ensure the connection started event is triggered
                 OnConnectionStarted();
-            } catch (Exception ex) {
-                _logger.LogError(ex, "TlsClient: Failed to auto-connect before writing data - {ExceptionType}: {Message}", 
-                    ex.GetType().Name, ex.Message);
-                if (ex.InnerException != null) {
+            }
+            catch (Exception ex)
+            {
+                var innerMsg = ex.InnerException != null ? $" Inner exception: {ex.InnerException.GetType().Name}: {ex.InnerException.Message}" : "";
+                _logger.LogError(ex, "TlsClient: Failed to auto-connect before writing data - {ExceptionType}: {Message}{InnerMsg}", 
+                    ex.GetType().Name, ex.Message, innerMsg);
+                
+                if (ex.InnerException != null)
+                {
                     _logger.LogError("TlsClient: Inner exception - {InnerType}: {InnerMessage}", 
                         ex.InnerException.GetType().Name, ex.InnerException.Message);
                 }
-                throw new InvalidOperationException("Cannot write to SSL stream: failed to connect automatically.", ex);
+                
+                throw new InvalidOperationException("Cannot write to SSL stream: failed to connect", ex);
             }
             
             // Double check that the stream was initialized
             if (_sslStream == null)
             {
                 _logger.LogError("TlsClient: SSL stream is still null after auto-connect attempt");
-                throw new InvalidOperationException("Cannot write to SSL stream: not connected");
+                throw new InvalidOperationException("SSL stream is not initialized after connection attempt. Call ConnectAsync first.");
             }
         }
-
-        _logger.LogDebug("TlsClient: Writing {ByteCount} bytes to SSL stream for {Host}:{Port}", 
-            data.Length, _host, _port);
         
-        try {
-            await _sslStream.WriteAsync(data, _cancellationTokenSource.Token);
-            _logger.LogDebug("TlsClient: Successfully wrote {ByteCount} bytes to SSL stream", data.Length);
-        } 
-        catch (IOException ioEx) {
-            _logger.LogError(ioEx, "TlsClient: IO error writing to SSL stream - {Message}", ioEx.Message);
-            if (ioEx.InnerException != null) {
-                _logger.LogError("TlsClient: Inner exception - {InnerType}: {InnerMessage}", 
-                    ioEx.InnerException.GetType().Name, ioEx.InnerException.Message);
-            }
+        // Get remote endpoint info for logging if available
+        string remoteEndpoint = "unknown";
+        if (_socket != null && _socket.Connected && _socket.RemoteEndPoint is System.Net.IPEndPoint ipEndPoint) 
+        {
+            remoteEndpoint = $"{ipEndPoint.Address}:{ipEndPoint.Port}";
+        }
+        
+        _logger.LogDebug("TlsClient: Writing {ByteCount} bytes to SSL stream for {Host}:{Port} {RemoteEndpoint}\n{DataPreview}",
+            data.Length, _host, _port, remoteEndpoint, StringUtils.GetDataPreview(data));
             
-            // Check if socket is still connected
-            bool isSocketConnected = _socket != null && _socket.Connected;
-            _logger.LogError("TlsClient: Socket connected status: {IsConnected}", isSocketConnected);
-            
-            // Try to get socket error code if available
-            if (_socket != null) {
-                try {
-                    var socketError = (SocketError)_socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error);
-                    _logger.LogError("TlsClient: Socket error code: {SocketError}", socketError);
-                } catch (Exception ex) {
-                    _logger.LogError(ex, "TlsClient: Error getting socket error code");
-                }
-            }
-            
-            throw;
-        }
-        catch (ObjectDisposedException dispEx) {
-            _logger.LogError(dispEx, "TlsClient: Stream was disposed before writing data");
-            throw;
-        }
-        catch (InvalidOperationException opEx) {
-            _logger.LogError(opEx, "TlsClient: Invalid operation writing to SSL stream - {Message}", opEx.Message);
-            throw;
-        }
-        catch (Exception ex) {
-            _logger.LogError(ex, "TlsClient: Unexpected error writing to SSL stream - {ExceptionType}: {Message}", 
-                ex.GetType().Name, ex.Message);
-            if (ex.InnerException != null) {
-                _logger.LogError("TlsClient: Inner exception - {InnerType}: {InnerMessage}", 
-                    ex.InnerException.GetType().Name, ex.InnerException.Message);
-            }
-            throw;
-        }
+        await _sslStream!.WriteAsync(data);
     }
 
     /// <summary>
@@ -828,7 +800,8 @@ public class TlsClient : BaseConnection, ITlsClient
             // Poll the socket with a zero timeout to check if it's still usable
             if (_socket.Poll(0, SelectMode.SelectError))
             {
-                var errorCode = (SocketError)_socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error);
+                var socketOption = _socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error);
+                var errorCode = socketOption is int code ? (SocketError)code : SocketError.NotSocket;
                 _logger.LogDebug("TlsClient: Connection health check failed - socket has error: {ErrorCode}", errorCode);
                 return false;
             }

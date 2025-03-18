@@ -2,6 +2,7 @@ using System.Net.Sockets;
 using System.IO.Pipelines;
 using CsProxyTools.Base;
 using CsProxyTools.Interfaces;
+using CsProxyTools.Helpers;
 using Microsoft.Extensions.Logging;
 
 namespace CsProxyTools.Clients;
@@ -37,6 +38,13 @@ public class TcpClient : BaseConnection, IClient
         _logger.LogDebug("TcpClient: Starting read stream task");
         try
         {
+            // Create endpoint info string
+            string remoteEndpoint = "unknown";
+            if (_socket != null && _socket.Connected && _socket.RemoteEndPoint is System.Net.IPEndPoint ipEndPoint) 
+            {
+                remoteEndpoint = $"{ipEndPoint.Address}:{ipEndPoint.Port}";
+            }
+            
             var buffer = new byte[8192];
             while (!_cancellationTokenSource.Token.IsCancellationRequested)
             {
@@ -50,8 +58,9 @@ public class TcpClient : BaseConnection, IClient
                 }
 
                 var memory = new ReadOnlyMemory<byte>(buffer, 0, bytesRead);
-                _logger.LogDebug("TcpClient: Triggering DataReceived event for {BytesRead} bytes", bytesRead);
-                OnDataReceived(memory);
+                _logger.LogDebug("TcpClient: Triggering DataReceived event for {BytesRead} bytes from {RemoteEndpoint}\n{DataPreview}", 
+                    bytesRead, remoteEndpoint, StringUtils.GetDataPreview(memory));
+                OnDataReceived(memory, remoteEndpoint);
             }
             _logger.LogDebug("TcpClient: Exited read loop normally");
         }
@@ -105,6 +114,16 @@ public class TcpClient : BaseConnection, IClient
                 throw new InvalidOperationException("Stream is not initialized after connection attempt. Call StartAsync first.");
             }
         }
+        
+        // Get remote endpoint info for logging if available
+        string remoteEndpoint = "unknown";
+        if (_socket != null && _socket.Connected && _socket.RemoteEndPoint is System.Net.IPEndPoint ipEndPoint) 
+        {
+            remoteEndpoint = $"{ipEndPoint.Address}:{ipEndPoint.Port}";
+        }
+        
+        _logger.LogDebug("TcpClient: Writing {ByteCount} bytes to {RemoteEndpoint}\n{DataPreview}", 
+            buffer.Length, remoteEndpoint, StringUtils.GetDataPreview(buffer));
         await _stream.WriteAsync(buffer);
     }
 

@@ -10,10 +10,18 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Net.Security;
 using System.Security.Authentication;
+using Microsoft.Extensions.Logging.Console;
 
 var loggerFactory = LoggerFactory.Create(builder =>
 {
-    builder.AddConsole();
+    builder.AddConsole(options =>
+    {
+        // Use simple console formatter 
+        options.FormatterName = ConsoleFormatterNames.Simple;
+        // No timestamps in console output (reduces clutter)
+        options.TimestampFormat = "[HH:mm:ss] ";
+        options.UseUtcTimestamp = false;
+    });
     builder.SetMinimumLevel(LogLevel.Information);
 });
 

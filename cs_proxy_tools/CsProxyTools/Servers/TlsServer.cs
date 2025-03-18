@@ -6,6 +6,8 @@ using System.IO.Pipelines;
 using CsProxyTools.Base;
 using CsProxyTools.Interfaces;
 using Microsoft.Extensions.Logging;
+using System.Security.Authentication;
+using CsProxyTools.Helpers;
 
 namespace CsProxyTools.Servers;
 
@@ -106,22 +108,18 @@ public class TlsServer : BaseConnection, IServer
 
     protected override async Task WriteDataAsync(ReadOnlyMemory<byte> buffer)
     {
-        var clients = new List<SslStream>();
-        lock (_clientsLock)
-        {
-            clients.AddRange(_clients);
-        }
-
-        foreach (var client in clients)
+        _logger.LogDebug("TlsServer: Broadcasting {ByteCount} bytes to {ClientCount} clients\n{DataPreview}", 
+            buffer.Length, _clients.Count, StringUtils.GetDataPreview(buffer));
+        
+        foreach (var sslStream in _clients.ToArray())
         {
             try
             {
-                await client.WriteAsync(buffer);
+                await sslStream.WriteAsync(buffer);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error writing to client");
-                await RemoveClientAsync(client);
             }
         }
     }
@@ -200,8 +198,16 @@ public class TlsServer : BaseConnection, IServer
             throw new InvalidOperationException("Server certificate not initialized");
         }
 
-        var clientId = Guid.NewGuid().ToString();
-        _logger.LogDebug("TlsServer: Handling new client connection {ClientId}", clientId);
+        // Create a meaningful clientId that includes IP:Port
+        var remoteEndPoint = client.RemoteEndPoint as System.Net.IPEndPoint;
+        var clientIpPort = remoteEndPoint != null 
+            ? $"{remoteEndPoint.Address}:{remoteEndPoint.Port}" 
+            : "unknown";
+        
+        var clientId = $"{Guid.NewGuid():N}";
+        
+        _logger.LogDebug("TLS Server: Handling new client connection {ClientIpPort}:{ClientId}", 
+            clientIpPort, clientId);
         
         // Set socket options for better reliability
         client.NoDelay = true;
@@ -216,7 +222,8 @@ public class TlsServer : BaseConnection, IServer
 
         try
         {
-            _logger.LogDebug("TlsServer: Starting SSL authentication with client {ClientId}", clientId);
+            _logger.LogDebug("TLS Server: Starting SSL authentication with client {ClientIpPort}:{ClientId}", 
+                clientIpPort, clientId);
             
             // Create a cancellation token with timeout
             using var handshakeTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
@@ -242,35 +249,39 @@ public class TlsServer : BaseConnection, IServer
             }
             catch (OperationCanceledException ex)
             {
-                _logger.LogWarning("TlsServer: TLS handshake timed out for client {ClientId}: {Message}", clientId, ex.Message);
+                _logger.LogWarning("TlsServer: TLS handshake timed out for client {ClientIpPort}:{ClientId}: {Message}", 
+                    clientIpPort, clientId, ex.Message);
                 throw;
             }
             catch (IOException ex) 
             {
-                _logger.LogWarning("TlsServer: TLS handshake IO error for client {ClientId}: {Message}", clientId, ex.Message);
+                _logger.LogWarning("TlsServer: TLS handshake IO error for client {ClientIpPort}:{ClientId}: {Message}", 
+                    clientIpPort, clientId, ex.Message);
                 throw;
             }
             catch (Exception ex)
             {
-                _logger.LogWarning("TlsServer: TLS handshake error for client {ClientId}: {Message}", clientId, ex.Message);
+                _logger.LogWarning("TlsServer: TLS handshake error for client {ClientIpPort}:{ClientId}: {Message}", 
+                    clientIpPort, clientId, ex.Message);
                 throw;
             }
             
-            _logger.LogDebug("TlsServer: SSL authentication completed with client {ClientId}", clientId);
-            _logger.LogDebug("TlsServer: Protocol: {Protocol}, Cipher: {Cipher} ({Strength} bit)", 
+            // Finish up SSL handshake and proceed with connection
+            _logger.LogDebug("TLS Server: SSL authentication completed with client {ClientIpPort}:{ClientId}", 
+                clientIpPort, clientId);
+            _logger.LogDebug("TLS Server: Protocol: {Protocol}, Cipher: {Cipher} ({Strength} bit)",
                 sslStream.SslProtocol, sslStream.CipherAlgorithm, sslStream.CipherStrength);
-            
-            // Check if the client provided a certificate when required
-            if (_requireClientCert)
+
+            // Check if client provided a certificate when required
+            if (_requireClientCert && sslStream.RemoteCertificate == null)
             {
-                if (sslStream.RemoteCertificate == null)
-                {
-                    _logger.LogWarning("TlsServer: Client {ClientId} did not provide a required certificate", clientId);
-                    throw new InvalidOperationException("Client certificate was required but not provided");
-                }
-                
-                _logger.LogDebug("TlsServer: Client {ClientId} authenticated with certificate {Subject}", 
-                    clientId, sslStream.RemoteCertificate.Subject);
+                _logger.LogWarning("TLS Server: Client {ClientIpPort}:{ClientId} did not provide a required certificate", 
+                    clientIpPort, clientId);
+            }
+            else if (sslStream.RemoteCertificate != null)
+            {
+                _logger.LogDebug("TLS Server: Client {ClientIpPort}:{ClientId} authenticated with certificate {Subject}",
+                    clientIpPort, clientId, sslStream.RemoteCertificate.Subject);
             }
 
             lock (_clientsLock)
@@ -278,7 +289,8 @@ public class TlsServer : BaseConnection, IServer
                 _clients.Add(sslStream);
             }
 
-            ClientConnected?.Invoke(this, new ConnectionEventArgs(clientId));
+            // Add remote endpoint info to connection event args
+            ClientConnected?.Invoke(this, new ConnectionEventArgs(clientId, clientIpPort));
 
             // Use a larger buffer for TLS frames
             var buffer = new byte[16384];
@@ -292,47 +304,59 @@ public class TlsServer : BaseConnection, IServer
                     
                     if (bytesRead == 0)
                     {
-                        _logger.LogDebug("TlsServer: Client {ClientId} closed connection (0 bytes read)", clientId);
+                        _logger.LogDebug("TLS Server: Client {ClientIpPort}:{ClientId} closed connection (0 bytes read)", 
+                            clientIpPort, clientId);
                         break;
                     }
                     
-                    _logger.LogTrace("TlsServer: Read {BytesRead} bytes from client {ClientId}", bytesRead, clientId);
+                    _logger.LogTrace("TLS Server: Read {BytesRead} bytes from client {ClientIpPort}:{ClientId}", 
+                        bytesRead, clientIpPort, clientId);
+                    var memory = new ReadOnlyMemory<byte>(buffer, 0, bytesRead);
+                    
+                    _logger.LogDebug("TLS Server: Client {ClientIpPort}:{ClientId} data received\n{DataPreview}",
+                        clientIpPort, clientId, StringUtils.GetDataPreview(memory));
+                    
+                    // Pass endpoint info into data received event
+                    OnDataReceived(new DataReceivedEventArgs(clientId, memory, clientIpPort));
                 }
                 catch (OperationCanceledException)
                 {
-                    _logger.LogDebug("TlsServer: Read operation canceled for client {ClientId}", clientId);
+                    _logger.LogDebug("TLS Server: Read operation canceled for client {ClientIpPort}:{ClientId}", 
+                        clientIpPort, clientId);
                     break;
                 }
-                catch (IOException ex)
+                catch (IOException ioEx)
                 {
-                    _logger.LogDebug("TlsServer: IO exception reading from client {ClientId}: {Message}", clientId, ex.Message);
+                    _logger.LogDebug("TLS Server: IO exception reading from client {ClientIpPort}:{ClientId}: {Message}", 
+                        clientIpPort, clientId, ioEx.Message);
                     break;
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "TlsServer: Error reading from client {ClientId}", clientId);
+                    _logger.LogError(ex, "TLS Server: Error reading from client {ClientIpPort}:{ClientId}", 
+                        clientIpPort, clientId);
                     break;
                 }
-
-                var data = new byte[bytesRead];
-                Array.Copy(buffer, data, bytesRead);
-                OnDataReceived(data);
             }
         }
         catch (OperationCanceledException)
         {
-            // Normal cancellation, ignore
-            _logger.LogDebug("TlsServer: Operation canceled for client {ClientId}", clientId);
+            _logger.LogDebug("TLS Server: Operation canceled for client {ClientIpPort}:{ClientId}", 
+                clientIpPort, clientId);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "TlsServer: Error handling client {ClientId}", clientId);
+            _logger.LogError(ex, "TLS Server: Error handling client {ClientIpPort}:{ClientId}", 
+                clientIpPort, clientId);
         }
         finally
         {
-            _logger.LogDebug("TlsServer: Cleaning up connection for client {ClientId}", clientId);
+            _logger.LogDebug("TLS Server: Cleaning up connection for client {ClientIpPort}:{ClientId}", 
+                clientIpPort, clientId);
             await RemoveClientAsync(sslStream);
-            ClientDisconnected?.Invoke(this, new ConnectionEventArgs(clientId));
+            
+            // Include IP:port in disconnect event
+            ClientDisconnected?.Invoke(this, new ConnectionEventArgs(clientId, clientIpPort));
         }
     }
 

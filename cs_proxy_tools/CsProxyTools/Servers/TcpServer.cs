@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.IO.Pipelines;
 using CsProxyTools.Base;
+using CsProxyTools.Helpers;
 using CsProxyTools.Interfaces;
 using Microsoft.Extensions.Logging;
 
@@ -62,22 +63,20 @@ public class TcpServer : BaseConnection, IServer
 
     protected override async Task WriteDataAsync(ReadOnlyMemory<byte> buffer)
     {
-        var clients = new List<Socket>();
-        lock (_clientsLock)
-        {
-            clients.AddRange(_clients);
-        }
-
-        foreach (var client in clients)
+        _logger.LogDebug("TcpServer: Broadcasting {ByteCount} bytes to {ClientCount} clients\n{DataPreview}", 
+            buffer.Length, _clients.Count, StringUtils.GetDataPreview(buffer));
+        
+        byte[] dataBuffer = buffer.ToArray();
+        
+        foreach (var client in _clients.ToArray())
         {
             try
             {
-                await client.SendAsync(buffer);
+                await client.SendAsync(dataBuffer, SocketFlags.None);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error writing to client");
-                await RemoveClientAsync(client);
             }
         }
     }
@@ -104,13 +103,20 @@ public class TcpServer : BaseConnection, IServer
 
     private async Task HandleClientAsync(Socket client)
     {
-        var clientId = Guid.NewGuid().ToString();
+        var remoteEndPoint = client.RemoteEndPoint as System.Net.IPEndPoint;
+        var clientIpPort = remoteEndPoint != null 
+            ? $"{remoteEndPoint.Address}:{remoteEndPoint.Port}" 
+            : "unknown";
+        
+        var clientId = $"{Guid.NewGuid():N}";
+        
         lock (_clientsLock)
         {
             _clients.Add(client);
         }
 
-        ClientConnected?.Invoke(this, new ConnectionEventArgs(clientId));
+        _logger.LogInformation("TCP Client {ClientIpPort} connected with ID {ClientId}", clientIpPort, clientId);
+        ClientConnected?.Invoke(this, new ConnectionEventArgs(clientId, clientIpPort));
 
         try
         {
@@ -118,25 +124,33 @@ public class TcpServer : BaseConnection, IServer
             while (!_cancellationTokenSource.Token.IsCancellationRequested)
             {
                 var bytesRead = await client.ReceiveAsync(buffer, _cancellationTokenSource.Token);
-                if (bytesRead == 0) break;
+                if (bytesRead == 0)
+                {
+                    _logger.LogDebug("TCP Client {ClientIpPort}:{ClientId} closed connection (0 bytes read)", 
+                        clientIpPort, clientId);
+                    break;
+                }
 
                 var data = new byte[bytesRead];
                 Array.Copy(buffer, data, bytesRead);
-                OnDataReceived(data);
+                _logger.LogDebug("TCP Client {ClientIpPort}:{ClientId} received {BytesRead} bytes\n{DataPreview}", 
+                    clientIpPort, clientId, bytesRead, StringUtils.GetDataPreview(new ReadOnlyMemory<byte>(data)));
+                OnDataReceived(new DataReceivedEventArgs(clientId, new ReadOnlyMemory<byte>(data), clientIpPort));
             }
         }
         catch (OperationCanceledException)
         {
-            // Normal cancellation, ignore
+            _logger.LogDebug("TCP Client {ClientIpPort}:{ClientId} operation canceled", clientIpPort, clientId);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error handling client {ClientId}", clientId);
+            _logger.LogError(ex, "Error handling TCP client {ClientIpPort}:{ClientId}", clientIpPort, clientId);
         }
         finally
         {
             await RemoveClientAsync(client);
-            ClientDisconnected?.Invoke(this, new ConnectionEventArgs(clientId));
+            _logger.LogInformation("TCP Client {ClientIpPort}:{ClientId} disconnected", clientIpPort, clientId);
+            ClientDisconnected?.Invoke(this, new ConnectionEventArgs(clientId, clientIpPort));
         }
     }
 

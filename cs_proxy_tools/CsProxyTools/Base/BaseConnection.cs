@@ -45,9 +45,21 @@ public abstract class BaseConnection : IConnection
         _logger.LogDebug("BaseConnection: IsConnected set to false for {Id}", Id);
     }
 
-    protected virtual void OnDataReceived(ReadOnlyMemory<byte> data)
+    protected virtual void OnDataReceived(ReadOnlyMemory<byte> data, string? remoteEndpoint = null)
     {
-        DataReceived?.Invoke(this, new DataReceivedEventArgs(Id, data));
+        if (remoteEndpoint != null)
+        {
+            DataReceived?.Invoke(this, new DataReceivedEventArgs(Id, data, remoteEndpoint));
+        }
+        else
+        {
+            DataReceived?.Invoke(this, new DataReceivedEventArgs(Id, data));
+        }
+    }
+
+    protected virtual void OnDataReceived(DataReceivedEventArgs args)
+    {
+        DataReceived?.Invoke(this, args);
     }
 
     public virtual async Task StartAsync(CancellationToken cancellationToken = default)

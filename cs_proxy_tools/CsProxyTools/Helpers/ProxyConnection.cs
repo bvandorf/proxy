@@ -26,52 +26,60 @@ public class ProxyConnection : IAsyncDisposable
         _serverId = serverId ?? server.Id;
 
         // Set up event handlers
-        _client.DataReceived += OnClientDataReceived;
-        _server.DataReceived += OnServerDataReceived;
-        _client.ConnectionClosed += OnClientConnectionClosed;
-        _server.ConnectionClosed += OnServerConnectionClosed;
+        _client.DataReceived += Client_DataReceived;
+        _server.DataReceived += Server_DataReceived;
+        _client.ConnectionClosed += Client_Disconnected;
+        _server.ConnectionClosed += Server_Disconnected;
     }
 
-    private async void OnClientDataReceived(object? sender, DataReceivedEventArgs args)
+    private void Client_DataReceived(object? sender, DataReceivedEventArgs args)
     {
         try
         {
-            _logger.LogInformation("Client {ClientId} -> Server {ServerId}: {Length} bytes", 
-                _clientId, _serverId, args.Data.Length);
-            await _server.WriteAsync(args.Data);
+            var clientEndpoint = args.RemoteEndpoint ?? "unknown";
+            _logger.LogInformation("Client {ClientEndpoint}:{ClientId} -> Server {ServerId}: {Length} bytes\n{DataPreview}",
+                clientEndpoint, _clientId, _serverId, args.Data.Length, StringUtils.GetDataPreview(args.Data));
+            _ = _server.WriteAsync(args.Data);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error forwarding data from client {ClientId} to server {ServerId}", 
-                _clientId, _serverId);
+            var clientEndpoint = args.RemoteEndpoint ?? "unknown";
+            _logger.LogError(ex, "Error forwarding data from client {ClientEndpoint}:{ClientId} to server {ServerId}",
+                clientEndpoint, _clientId, _serverId);
         }
     }
 
-    private async void OnServerDataReceived(object? sender, DataReceivedEventArgs args)
+    private void Server_DataReceived(object? sender, DataReceivedEventArgs args)
     {
         try
         {
-            _logger.LogInformation("Server {ServerId} -> Client {ClientId}: {Length} bytes", 
-                _serverId, _clientId, args.Data.Length);
-            await _client.WriteAsync(args.Data);
+            var serverEndpoint = args.RemoteEndpoint ?? "unknown";
+            _logger.LogInformation("Server {ServerEndpoint}:{ServerId} -> Client {ClientId}: {Length} bytes\n{DataPreview}",
+                serverEndpoint, _serverId, _clientId, args.Data.Length, StringUtils.GetDataPreview(args.Data));
+            _ = _client.WriteAsync(args.Data);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error forwarding data from server {ServerId} to client {ClientId}", 
-                _serverId, _clientId);
+            var serverEndpoint = args.RemoteEndpoint ?? "unknown";
+            _logger.LogError(ex, "Error forwarding data from server {ServerEndpoint}:{ServerId} to client {ClientId}",
+                serverEndpoint, _serverId, _clientId);
         }
     }
 
-    private void OnClientConnectionClosed(object? sender, ConnectionEventArgs args)
+    private void Client_Disconnected(object? sender, ConnectionEventArgs args)
     {
-        _logger.LogInformation("Client {ClientId} connection closed", _clientId);
-        DisposeAsync().ConfigureAwait(false);
+        var clientEndpoint = args.RemoteEndpoint ?? "unknown";
+        _logger.LogInformation("Client {ClientEndpoint}:{ClientId} connection closed", 
+            clientEndpoint, _clientId);
+        _server.StopAsync().GetAwaiter().GetResult();
     }
 
-    private void OnServerConnectionClosed(object? sender, ConnectionEventArgs args)
+    private void Server_Disconnected(object? sender, ConnectionEventArgs args)
     {
-        _logger.LogInformation("Server {ServerId} connection closed", _serverId);
-        DisposeAsync().ConfigureAwait(false);
+        var serverEndpoint = args.RemoteEndpoint ?? "unknown";
+        _logger.LogInformation("Server {ServerEndpoint}:{ServerId} connection closed", 
+            serverEndpoint, _serverId);
+        _client.StopAsync().GetAwaiter().GetResult();
     }
 
     public async ValueTask DisposeAsync()
@@ -81,10 +89,10 @@ public class ProxyConnection : IAsyncDisposable
         try
         {
             // Remove event handlers
-            _client.DataReceived -= OnClientDataReceived;
-            _server.DataReceived -= OnServerDataReceived;
-            _client.ConnectionClosed -= OnClientConnectionClosed;
-            _server.ConnectionClosed -= OnServerConnectionClosed;
+            _client.DataReceived -= Client_DataReceived;
+            _server.DataReceived -= Server_DataReceived;
+            _client.ConnectionClosed -= Client_Disconnected;
+            _server.ConnectionClosed -= Server_Disconnected;
 
             // Dispose both connections
             await _client.DisposeAsync();

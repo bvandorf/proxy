@@ -172,12 +172,13 @@ public class TcpClientTests : IDisposable
     [Fact(Timeout = 30000)]
     public async Task WriteAsync_ShouldThrowException_WhenNotConnected()
     {
-        // Arrange
-        var client = new CsProxyTools.Clients.TcpClient(_loggerMock.Object, _host, _port);
+        // Arrange - Use an invalid host to ensure auto-connect fails
+        var client = new CsProxyTools.Clients.TcpClient(_loggerMock.Object, "invalid-host-that-does-not-exist", 12345);
+
         var data = new byte[] { 1, 2, 3 };
 
         // Act & Assert
-        await Assert.ThrowsAsync<InvalidOperationException>(() => 
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
             client.WriteAsync(new ReadOnlyMemory<byte>(data)));
         await client.DisposeAsync();
     }

@@ -18,12 +18,18 @@ public interface IConnection : IAsyncDisposable
 public class ConnectionEventArgs : EventArgs
 {
     public string ConnectionId { get; }
-    public DateTime Timestamp { get; }
+    public string? RemoteEndpoint { get; }
 
     public ConnectionEventArgs(string connectionId)
     {
         ConnectionId = connectionId;
-        Timestamp = DateTime.UtcNow;
+        RemoteEndpoint = null;
+    }
+    
+    public ConnectionEventArgs(string connectionId, string remoteEndpoint)
+    {
+        ConnectionId = connectionId;
+        RemoteEndpoint = remoteEndpoint;
     }
 }
 
@@ -31,12 +37,19 @@ public class DataReceivedEventArgs : EventArgs
 {
     public string ConnectionId { get; }
     public ReadOnlyMemory<byte> Data { get; }
-    public DateTime Timestamp { get; }
+    public string? RemoteEndpoint { get; }
 
     public DataReceivedEventArgs(string connectionId, ReadOnlyMemory<byte> data)
     {
         ConnectionId = connectionId;
         Data = data;
-        Timestamp = DateTime.UtcNow;
+        RemoteEndpoint = null;
+    }
+    
+    public DataReceivedEventArgs(string connectionId, ReadOnlyMemory<byte> data, string remoteEndpoint)
+    {
+        ConnectionId = connectionId;
+        Data = data;
+        RemoteEndpoint = remoteEndpoint;
     }
 } 
