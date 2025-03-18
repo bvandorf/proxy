@@ -6,6 +6,7 @@ using CsProxyTools.Base;
 using CsProxyTools.Interfaces;
 using Microsoft.Extensions.Logging;
 using System.Text;
+using System.Net;
 
 namespace CsProxyTools.Clients;
 
@@ -70,26 +71,170 @@ public class TlsClient : BaseConnection, ITlsClient
 
     protected override async Task StartConnectionAsync()
     {
+        // Validate connection parameters first
+        if (string.IsNullOrEmpty(_host))
+        {
+            throw new ArgumentException("Host cannot be null or empty", nameof(_host));
+        }
+
+        if (_port <= 0 || _port > 65535)
+        {
+            throw new ArgumentException($"Port must be between 1 and 65535, got {_port}", nameof(_port));
+        }
+
         // First establish TCP connection
         _logger.LogDebug("TlsClient: Starting TCP connection to {Host}:{Port}", _host, _port);
         
         try
         {
-            // Configure socket for better performance with TLS
-            _socket.ReceiveBufferSize = 16384; // Larger buffer for TLS frames
-            _socket.SendBufferSize = 16384;
-            _socket.NoDelay = true; // Disable Nagle algorithm for lower latency
-            _socket.LingerState = new LingerOption(false, 0); // Don't linger on close
-            
-            // Set adequate timeouts
-            _socket.ReceiveTimeout = (int)TimeSpan.FromSeconds(30).TotalMilliseconds;
-            _socket.SendTimeout = (int)TimeSpan.FromSeconds(30).TotalMilliseconds;
-            
-            _logger.LogDebug("TlsClient: Connecting to {Host}:{Port}", _host, _port);
-            await _socket.ConnectAsync(_host, _port);
-            
-            if (!_socket.Connected)
+            // Ensure the socket is properly created and not in an invalid state
+            if (_socket == null || _socket.Connected)
             {
+                // If socket exists and is connected, dispose it first
+                if (_socket != null)
+                {
+                    _logger.LogDebug("TlsClient: Disposing existing socket before creating a new one");
+                    _socket.Dispose();
+                }
+                
+                _socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                _logger.LogDebug("TlsClient: Created new socket");
+            }
+            
+            // Configure socket for better performance with TLS
+            _logger.LogDebug("TlsClient: Configuring socket options");
+            try
+            {
+                _socket.ReceiveBufferSize = 16384; // Larger buffer for TLS frames
+                _socket.SendBufferSize = 16384;
+                _socket.NoDelay = true; // Disable Nagle algorithm for lower latency
+                _socket.LingerState = new LingerOption(false, 0); // Don't linger on close
+                
+                // Set adequate timeouts - validate the values are positive
+                int timeout = (int)TimeSpan.FromSeconds(30).TotalMilliseconds;
+                if (timeout > 0)
+                {
+                    _socket.ReceiveTimeout = timeout;
+                    _socket.SendTimeout = timeout;
+                }
+                else
+                {
+                    _logger.LogWarning("TlsClient: Invalid timeout value, not setting socket timeouts");
+                }
+            }
+            catch (SocketException sx)
+            {
+                _logger.LogWarning(sx, "TlsClient: Error setting socket options, continuing anyway: {Error}", sx.SocketErrorCode);
+            }
+            
+            // Attempt to resolve the hostname to check if it's valid before connecting
+            IPAddress[] addresses;
+            try
+            {
+                _logger.LogDebug("TlsClient: Resolving hostname: {Host}", _host);
+                // Check if the host is an IP address first
+                if (IPAddress.TryParse(_host, out var ipAddress))
+                {
+                    addresses = new[] { ipAddress };
+                    _logger.LogDebug("TlsClient: Host is a valid IP address: {Address}", ipAddress);
+                }
+                else
+                {
+                    // Resolve hostname to IP addresses
+                    addresses = await Dns.GetHostAddressesAsync(_host);
+                    _logger.LogDebug("TlsClient: Resolved {Host} to {AddressCount} addresses", _host, addresses.Length);
+                    foreach (var addr in addresses)
+                    {
+                        _logger.LogDebug("TlsClient: Resolved address: {Address} ({AddressFamily})", addr, addr.AddressFamily);
+                    }
+                }
+                
+                // If no addresses were resolved, throw an exception
+                if (addresses.Length == 0)
+                {
+                    throw new InvalidOperationException($"Could not resolve hostname: {_host}");
+                }
+                
+                // Prefer IPv4 addresses if available
+                var ipv4Addresses = addresses.Where(a => a.AddressFamily == AddressFamily.InterNetwork).ToArray();
+                if (ipv4Addresses.Length > 0)
+                {
+                    addresses = ipv4Addresses;
+                    _logger.LogDebug("TlsClient: Using IPv4 addresses");
+                }
+                else
+                {
+                    _logger.LogDebug("TlsClient: No IPv4 addresses found, using all resolved addresses");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "TlsClient: Failed to resolve hostname: {Host}", _host);
+                throw new InvalidOperationException($"Failed to resolve hostname: {_host}", ex);
+            }
+            
+            // Try to connect using the resolved addresses
+            Exception? lastConnectException = null;
+            bool connected = false;
+            
+            foreach (var address in addresses)
+            {
+                try
+                {
+                    // Create endpoint with the resolved address
+                    var endpoint = new IPEndPoint(address, _port);
+                    _logger.LogDebug("TlsClient: Connecting to {Endpoint}", endpoint);
+                    
+                    // Connect to the endpoint
+                    await _socket.ConnectAsync(endpoint);
+                    connected = _socket.Connected;
+                    
+                    if (connected)
+                    {
+                        _logger.LogDebug("TlsClient: Successfully connected to {Endpoint}", endpoint);
+                        break;
+                    }
+                }
+                catch (SocketException sx)
+                {
+                    lastConnectException = sx;
+                    _logger.LogWarning(sx, "TlsClient: Socket error connecting to {Address}:{Port}, SocketError: {Error}", 
+                        address, _port, sx.SocketErrorCode);
+                    
+                    // If this is not the last address, try the next one
+                    if (address != addresses.Last())
+                    {
+                        _logger.LogDebug("TlsClient: Will try next address");
+                        continue;
+                    }
+                    
+                    // Otherwise, re-throw the last exception
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    lastConnectException = ex;
+                    _logger.LogWarning(ex, "TlsClient: Error connecting to {Address}:{Port}", address, _port);
+                    
+                    // If this is not the last address, try the next one
+                    if (address != addresses.Last())
+                    {
+                        _logger.LogDebug("TlsClient: Will try next address");
+                        continue;
+                    }
+                    
+                    // Otherwise, re-throw the last exception
+                    throw;
+                }
+            }
+            
+            // Verify connection was successful
+            if (!connected)
+            {
+                if (lastConnectException != null)
+                {
+                    throw lastConnectException;
+                }
                 throw new InvalidOperationException($"Failed to connect to {_host}:{_port}");
             }
             
@@ -111,7 +256,8 @@ public class TlsClient : BaseConnection, ITlsClient
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "TlsClient: Failed to establish TCP connection to {Host}:{Port}", _host, _port);
+            _logger.LogError(ex, "TlsClient: Failed to establish TCP connection to {Host}:{Port} - {ExceptionType}: {Message}", 
+                _host, _port, ex.GetType().Name, ex.Message);
             CleanupConnection();
             throw;
         }
@@ -217,15 +363,59 @@ public class TlsClient : BaseConnection, ITlsClient
             try
             {
                 // Create a new socket for the retry
-                _socket.Dispose();
                 _socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                _logger.LogDebug("TlsClient: Created new socket for retry");
                 
+                // Configure socket
                 _socket.ReceiveBufferSize = 16384;
                 _socket.SendBufferSize = 16384;
                 _socket.NoDelay = true;
                 _socket.LingerState = new LingerOption(false, 0);
                 
-                await _socket.ConnectAsync(_host, _port);
+                // Use a timeout for this connection attempt
+                var connectTimeout = TimeSpan.FromSeconds(30);
+                _logger.LogDebug("TlsClient: Connecting to {Host}:{Port} with timeout {Timeout}ms", 
+                    _host, _port, connectTimeout.TotalMilliseconds);
+                
+                // Resolve the hostname again
+                IPAddress[] addresses;
+                if (IPAddress.TryParse(_host, out var ipAddress))
+                {
+                    addresses = new[] { ipAddress };
+                }
+                else
+                {
+                    addresses = await Dns.GetHostAddressesAsync(_host);
+                    // Prefer IPv4 addresses if available
+                    var ipv4Addresses = addresses.Where(a => a.AddressFamily == AddressFamily.InterNetwork).ToArray();
+                    if (ipv4Addresses.Length > 0)
+                    {
+                        addresses = ipv4Addresses;
+                    }
+                }
+                
+                // Try to connect to the first address
+                if (addresses.Length > 0)
+                {
+                    var endpoint = new IPEndPoint(addresses[0], _port);
+                    _logger.LogDebug("TlsClient: Connecting to {Endpoint} for retry", endpoint);
+                    
+                    using (var cts = new CancellationTokenSource(connectTimeout))
+                    {
+                        try
+                        {
+                            await _socket.ConnectAsync(endpoint).WaitAsync(cts.Token);
+                        }
+                        catch (TimeoutException)
+                        {
+                            throw new TimeoutException($"Connection attempt timed out after {connectTimeout.TotalSeconds} seconds");
+                        }
+                    }
+                }
+                else
+                {
+                    throw new InvalidOperationException($"Could not resolve hostname: {_host}");
+                }
                 
                 if (!_socket.Connected)
                 {
@@ -234,6 +424,7 @@ public class TlsClient : BaseConnection, ITlsClient
                 
                 // Create a new network stream
                 _stream = new NetworkStream(_socket, true);
+                _logger.LogDebug("TlsClient: Created new network stream for retry");
                 
                 // Create a new SSL stream
                 _sslStream = new SslStream(
@@ -242,10 +433,12 @@ public class TlsClient : BaseConnection, ITlsClient
                     ValidateServerCertificate,
                     null,
                     EncryptionPolicy.RequireEncryption);
+                _logger.LogDebug("TlsClient: Created new SSL stream for retry");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "TlsClient: Failed to re-establish TCP connection on retry {Attempt}", retryCount);
+                _logger.LogError(ex, "TlsClient: Failed to re-establish TCP connection on retry {Attempt} - {ExceptionType}: {Message}", 
+                    retryCount, ex.GetType().Name, ex.Message);
                 CleanupConnection();
                 throw;
             }
@@ -263,16 +456,19 @@ public class TlsClient : BaseConnection, ITlsClient
         
         SslStream? sslStreamToDispose = null;
         NetworkStream? networkStreamToDispose = null;
+        Socket? socketToDispose = null;
         
         // Safely capture references to disposable objects
         lock (this)
         {
             sslStreamToDispose = _sslStream;
             networkStreamToDispose = _stream;
+            socketToDispose = _socket;
             
             // Clear the references to prevent reuse
             _sslStream = null;
             _stream = null;
+            _socket = null;
         }
         
         // Now dispose the captured references outside the lock
@@ -304,31 +500,34 @@ public class TlsClient : BaseConnection, ITlsClient
         
         try
         {
-            if (_socket.Connected)
+            if (socketToDispose != null)
             {
-                _logger.LogDebug("TlsClient: Closing connected socket");
+                _logger.LogDebug("TlsClient: Disposing socket");
+                
                 try
                 {
-                    _socket.Shutdown(SocketShutdown.Both);
+                    // Attempt to gracefully close the socket if it's connected
+                    if (socketToDispose.Connected)
+                    {
+                        socketToDispose.Shutdown(SocketShutdown.Both);
+                        _logger.LogDebug("TlsClient: Socket shutdown completed");
+                    }
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogDebug("TlsClient: Error during socket shutdown: {Message}", ex.Message);
+                    _logger.LogWarning(ex, "TlsClient: Error shutting down socket");
                 }
                 
-                _socket.Close(0); // Close immediately without linger
+                socketToDispose.Dispose();
+                _logger.LogDebug("TlsClient: Socket disposed");
             }
-        }
-        catch (ObjectDisposedException)
-        {
-            _logger.LogDebug("TlsClient: Socket was already disposed");
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "TlsClient: Error during socket cleanup");
+            _logger.LogWarning(ex, "TlsClient: Error disposing socket");
         }
         
-        _logger.LogDebug("TlsClient: Connection cleanup completed");
+        _logger.LogDebug("TlsClient: Connection resources cleanup completed");
     }
 
     private async Task ReadStreamAsync()
@@ -432,24 +631,29 @@ public class TlsClient : BaseConnection, ITlsClient
 
     protected override async Task StopConnectionAsync()
     {
-        _logger.LogDebug("TlsClient: Stopping connection");
-        try
+        _logger.LogDebug("TlsClient: StopConnectionAsync called");
+        
+        // Gracefully close the SSL connection if possible
+        if (_sslStream != null)
         {
-            if (_sslStream != null)
+            try
             {
-                // Try to shut down the TLS session gracefully
+                _logger.LogDebug("TlsClient: Closing SSL stream");
                 await _sslStream.ShutdownAsync();
-                _logger.LogDebug("TlsClient: SSL shutdown completed");
+                _logger.LogDebug("TlsClient: SSL stream shutdown completed successfully");
+            }
+            catch (ObjectDisposedException)
+            {
+                _logger.LogDebug("TlsClient: SSL stream was already disposed");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "TlsClient: Error during SSL stream shutdown");
             }
         }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "TlsClient: Error during SSL shutdown");
-        }
-        finally
-        {
-            CleanupConnection();
-        }
+        
+        // Clean up all connection resources
+        CleanupConnection();
         _logger.LogDebug("TlsClient: Connection stopped");
     }
 
@@ -493,7 +697,21 @@ public class TlsClient : BaseConnection, ITlsClient
     {
         await StopConnectionAsync();
         CleanupConnection();
-        _socket.Dispose();
+        
+        // At this point _socket should be null since CleanupConnection was called
+        // but we'll check anyway to avoid any NullReferenceException
+        if (_socket != null)
+        {
+            try
+            {
+                _socket.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "TlsClient: Error disposing socket during DisposeAsync");
+            }
+        }
+        
         await base.DisposeAsync();
     }
 
