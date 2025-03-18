@@ -23,33 +23,57 @@ public static class StringUtils
         return new string(hexChars);
     }
     
+    /// <summary>
+    /// Converts a byte array to a formatted hexadecimal string with spaces
+    /// </summary>
+    public static string ToFormattedHexString(ReadOnlySpan<byte> data, int bytesPerGroup = 16, string separator = " ")
+    {
+        if (data.IsEmpty)
+            return string.Empty;
+
+        var sb = new StringBuilder();
+        for (int i = 0; i < data.Length; i++)
+        {
+            sb.Append(data[i].ToString("x2"));
+            
+            // Add separator after each group (except at the end)
+            if ((i + 1) % bytesPerGroup == 0 && i < data.Length - 1)
+            {
+                sb.Append(separator);
+            }
+            else if (i < data.Length - 1)
+            {
+                sb.Append(separator);
+            }
+        }
+        return sb.ToString();
+    }
+    
     private static char GetHexChar(int value)
     {
         return (char)(value < 10 ? '0' + value : 'a' + (value - 10));
     }
     
     /// <summary>
-    /// Gets a preview of text data with hex representation
+    /// Gets a detailed preview of data with both text and hex representation, without truncation
     /// </summary>
-    public static string GetDataPreview(ReadOnlyMemory<byte> data, int maxTextLength = 100)
+    public static string GetDataPreview(ReadOnlyMemory<byte> data)
     {
         var span = data.Span;
         
-        // Text representation (truncated if too long)
-        var textLength = Math.Min(span.Length, maxTextLength);
+        // Text representation (full, no truncation)
         string textPreview;
         
         try
         {
-            textPreview = Encoding.UTF8.GetString(span.Slice(0, textLength));
-            if (span.Length > maxTextLength)
-                textPreview += "...";
+            // Get full text representation
+            var rawText = Encoding.UTF8.GetString(span);
             
-            // Replace non-printable characters with dots
-            var sb = new StringBuilder(textPreview.Length);
-            foreach (char c in textPreview)
+            // Replace non-printable characters with dots for readability
+            var sb = new StringBuilder(rawText.Length);
+            foreach (char c in rawText)
             {
-                sb.Append(char.IsControl(c) ? '.' : c);
+                sb.Append(char.IsControl(c) && c != '\r' && c != '\n' && c != '\t' ? '.' : c);
             }
             textPreview = sb.ToString();
         }
@@ -61,6 +85,6 @@ public static class StringUtils
         // Hex representation (full)
         var hexString = ToHexString(span);
         
-        return $"{textPreview}\nHEX: {hexString}";
+        return $"TEXT: {textPreview}\nHEX:  {hexString}";
     }
 } 
