@@ -13,12 +13,13 @@ public class TlsServer : BaseConnection, IServer
 {
     private readonly string _host;
     private readonly int _port;
-    private readonly string _certificatePath;
-    private readonly string _certificatePassword;
-    private readonly X509Certificate2 _certificate;
+    private readonly string? _certificatePath;
+    private readonly string? _certificatePassword;
     private readonly Socket _listener;
     private readonly List<SslStream> _clients;
     private readonly object _clientsLock = new();
+    private X509Certificate2? _certificate;
+    private readonly bool _externalCertificate;
 
     public event EventHandler<ConnectionEventArgs>? ClientConnected;
     public event EventHandler<ConnectionEventArgs>? ClientDisconnected;
@@ -31,9 +32,9 @@ public class TlsServer : BaseConnection, IServer
         _port = port;
         _certificatePath = certificatePath;
         _certificatePassword = certificatePassword;
-        _certificate = null;
         _listener = new Socket(SocketType.Stream, ProtocolType.Tcp);
         _clients = new List<SslStream>();
+        _externalCertificate = false;
     }
 
     public TlsServer(ILogger logger, string host, int port, X509Certificate2 certificate) 
@@ -41,20 +42,25 @@ public class TlsServer : BaseConnection, IServer
     {
         _host = host;
         _port = port;
-        _certificate = certificate;
-        _certificatePath = "";
-        _certificatePassword = "";
+        _certificatePath = null;
+        _certificatePassword = null;
         _listener = new Socket(SocketType.Stream, ProtocolType.Tcp);
         _clients = new List<SslStream>();
+        _certificate = certificate;
+        _externalCertificate = true;
     }
 
     protected override async Task StartConnectionAsync()
     {
+        if (!_externalCertificate && _certificatePath != null && _certificatePassword != null)
+        {
+            _certificate = new X509Certificate2(_certificatePath, _certificatePassword);
+        }
+        
         _listener.Bind(new IPEndPoint(IPAddress.Parse(_host), _port));
         _listener.Listen(128);
         IsRunning = true;
         _ = AcceptClientsAsync();
-        await Task.CompletedTask;
     }
 
     protected override async Task StopConnectionAsync()
@@ -77,6 +83,13 @@ public class TlsServer : BaseConnection, IServer
         }
 
         _listener.Close();
+        
+        if (!_externalCertificate)
+        {
+            _certificate?.Dispose();
+            _certificate = null;
+        }
+        
         await Task.CompletedTask;
     }
 
@@ -124,25 +137,18 @@ public class TlsServer : BaseConnection, IServer
 
     private async Task HandleClientAsync(Socket client)
     {
+        if (_certificate == null)
+        {
+            throw new InvalidOperationException("Server certificate not initialized");
+        }
+
         var clientId = Guid.NewGuid().ToString();
         var stream = new NetworkStream(client);
         var sslStream = new SslStream(stream, false);
 
         try
         {
-            if (_certificate != null)
-            {
-                await sslStream.AuthenticateAsServerAsync(_certificate);
-            }
-            else if (_certificatePath != null && _certificatePassword != null)
-            {
-                var certificate = new X509Certificate2(_certificatePath, _certificatePassword);
-                await sslStream.AuthenticateAsServerAsync(certificate);
-            }
-            else
-            {
-                throw new InvalidOperationException("Certificate or certificate path and password must be provided");
-            }
+            await sslStream.AuthenticateAsServerAsync(_certificate, false, System.Security.Authentication.SslProtocols.None, false);
 
             lock (_clientsLock)
             {
@@ -200,5 +206,10 @@ public class TlsServer : BaseConnection, IServer
     {
         await base.DisposeAsync();
         _listener.Dispose();
+        
+        if (!_externalCertificate)
+        {
+            _certificate?.Dispose();
+        }
     }
 } 

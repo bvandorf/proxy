@@ -26,14 +26,30 @@ var tcpServerPort = 5000;
 var tlsServerPort = 5001;
 var targetHost = "localhost";
 var targetPort = 8080;
-var certificate = await LoadCertificateFromStore("CN=localhost", StoreName.My, StoreLocation.LocalMachine) ?? 
-    throw new Exception("Failed to load certificate");
+
+// Try to load certificate from store, fallback to file if not found
+var certificate = await LoadCertificateFromStore("CN=localhost", StoreName.My, StoreLocation.LocalMachine);
+if (certificate == null)
+{
+    programLogger.LogWarning("Failed to load certificate from store. Falling back to file.");
+    var certificatePath = "certificate.pfx";
+    var certificatePassword = "password";
+    try
+    {
+        certificate = new X509Certificate2(certificatePath, certificatePassword);
+    }
+    catch (Exception ex)
+    {
+        programLogger.LogError(ex, "Failed to load certificate from file {Path}", certificatePath);
+        throw new Exception("Failed to load certificate from both store and file");
+    }
+}
 
 // Create TCP server
 var tcpServer = new TcpServer(tcpServerLogger, "127.0.0.1", tcpServerPort);
 var tcpClient = new TcpClient(tcpClientLogger, targetHost, targetPort);
 
-// Create TLS server
+// Create TLS server with the certificate
 var tlsServer = new TlsServer(tlsServerLogger, "127.0.0.1", tlsServerPort, certificate);
 var tlsClient = new TlsClient(tlsClientLogger, targetHost, targetPort, validateCertificate: false);
 
