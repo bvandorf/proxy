@@ -660,27 +660,139 @@ public class TlsClient : BaseConnection, ITlsClient
     // Override the correct method from BaseConnection
     protected override async Task WriteDataAsync(ReadOnlyMemory<byte> data)
     {
-        if (_sslStream == null)
+        if (_sslStream == null || !IsConnectionHealthy())
         {
-            _logger.LogWarning("TlsClient: SSL stream is not initialized. Attempting to connect first.");
+            _logger.LogWarning("TlsClient: SSL connection is not healthy. Attempting to reconnect first.");
             try {
-                await StartConnectionAsync();
+                await StopConnectionAsync(); // First clean up any existing connection
+                await StartConnectionAsync(); // Then establish a fresh connection
                 // Ensure the connection started event is triggered
                 OnConnectionStarted();
             } catch (Exception ex) {
+                _logger.LogError(ex, "TlsClient: Failed to auto-connect before writing data - {ExceptionType}: {Message}", 
+                    ex.GetType().Name, ex.Message);
+                if (ex.InnerException != null) {
+                    _logger.LogError("TlsClient: Inner exception - {InnerType}: {InnerMessage}", 
+                        ex.InnerException.GetType().Name, ex.InnerException.Message);
+                }
                 throw new InvalidOperationException("Cannot write to SSL stream: failed to connect automatically.", ex);
             }
             
             // Double check that the stream was initialized
             if (_sslStream == null)
             {
+                _logger.LogError("TlsClient: SSL stream is still null after auto-connect attempt");
                 throw new InvalidOperationException("Cannot write to SSL stream: not connected");
             }
         }
 
-        _logger.LogTrace("TlsClient: Writing {ByteCount} bytes to SSL stream", data.Length);
-        await _sslStream.WriteAsync(data, _cancellationTokenSource.Token);
-        _logger.LogTrace("TlsClient: Finished writing to SSL stream");
+        _logger.LogDebug("TlsClient: Writing {ByteCount} bytes to SSL stream for {Host}:{Port}", 
+            data.Length, _host, _port);
+        
+        try {
+            await _sslStream.WriteAsync(data, _cancellationTokenSource.Token);
+            _logger.LogDebug("TlsClient: Successfully wrote {ByteCount} bytes to SSL stream", data.Length);
+        } 
+        catch (IOException ioEx) {
+            _logger.LogError(ioEx, "TlsClient: IO error writing to SSL stream - {Message}", ioEx.Message);
+            if (ioEx.InnerException != null) {
+                _logger.LogError("TlsClient: Inner exception - {InnerType}: {InnerMessage}", 
+                    ioEx.InnerException.GetType().Name, ioEx.InnerException.Message);
+            }
+            
+            // Check if socket is still connected
+            bool isSocketConnected = _socket != null && _socket.Connected;
+            _logger.LogError("TlsClient: Socket connected status: {IsConnected}", isSocketConnected);
+            
+            // Try to get socket error code if available
+            if (_socket != null) {
+                try {
+                    var socketError = (SocketError)_socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error);
+                    _logger.LogError("TlsClient: Socket error code: {SocketError}", socketError);
+                } catch (Exception ex) {
+                    _logger.LogError(ex, "TlsClient: Error getting socket error code");
+                }
+            }
+            
+            throw;
+        }
+        catch (ObjectDisposedException dispEx) {
+            _logger.LogError(dispEx, "TlsClient: Stream was disposed before writing data");
+            throw;
+        }
+        catch (InvalidOperationException opEx) {
+            _logger.LogError(opEx, "TlsClient: Invalid operation writing to SSL stream - {Message}", opEx.Message);
+            throw;
+        }
+        catch (Exception ex) {
+            _logger.LogError(ex, "TlsClient: Unexpected error writing to SSL stream - {ExceptionType}: {Message}", 
+                ex.GetType().Name, ex.Message);
+            if (ex.InnerException != null) {
+                _logger.LogError("TlsClient: Inner exception - {InnerType}: {InnerMessage}", 
+                    ex.InnerException.GetType().Name, ex.InnerException.Message);
+            }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Checks if the current connection is healthy and ready for data transfer
+    /// </summary>
+    /// <returns>True if the connection is healthy, false otherwise</returns>
+    private bool IsConnectionHealthy()
+    {
+        // Check if we have the basic components needed for a healthy connection
+        if (_sslStream == null || _stream == null || _socket == null)
+        {
+            _logger.LogDebug("TlsClient: Connection health check failed - missing stream or socket components");
+            return false;
+        }
+
+        // Check if the socket is connected
+        if (!_socket.Connected)
+        {
+            _logger.LogDebug("TlsClient: Connection health check failed - socket is not connected");
+            return false;
+        }
+
+        // Check if the socket is usable by checking for errors
+        try
+        {
+            // Poll the socket with a zero timeout to check if it's still usable
+            if (_socket.Poll(0, SelectMode.SelectError))
+            {
+                var errorCode = (SocketError)_socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error);
+                _logger.LogDebug("TlsClient: Connection health check failed - socket has error: {ErrorCode}", errorCode);
+                return false;
+            }
+
+            // Additional check: See if we can read/write data (with zero timeout - non-blocking)
+            bool canRead = _socket.Poll(0, SelectMode.SelectRead);
+            bool canWrite = _socket.Poll(0, SelectMode.SelectWrite);
+            
+            // If we can write but not read (normal for a healthy idle connection)
+            // or if we can both read and write, the socket is usable
+            if (canWrite)
+            {
+                _logger.LogDebug("TlsClient: Connection health check passed - socket is ready");
+                return true;
+            }
+            else
+            {
+                _logger.LogDebug("TlsClient: Connection health check failed - socket cannot write");
+                return false;
+            }
+        }
+        catch (SocketException sx)
+        {
+            _logger.LogDebug(sx, "TlsClient: Connection health check failed - socket exception: {Error}", sx.SocketErrorCode);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "TlsClient: Connection health check failed - exception during check");
+            return false;
+        }
     }
 
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
