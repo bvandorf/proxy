@@ -27,4 +27,5 @@ public interface ITlsClient : IClient
     string Host { get; }
     int Port { get; }
     bool ValidateCertificate { get; }
+    Task SendAuthenticationHeaderAsync(string headerName, string headerValue);
 } 

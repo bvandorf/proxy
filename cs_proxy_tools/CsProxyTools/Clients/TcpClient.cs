@@ -90,7 +90,20 @@ public class TcpClient : BaseConnection, IClient
     {
         if (_stream == null)
         {
-            throw new InvalidOperationException("Stream is not initialized. Call StartAsync first.");
+            _logger.LogWarning("TcpClient: Stream is not initialized. Attempting to connect first.");
+            try {
+                await StartConnectionAsync();
+                // Ensure the connection started event is triggered
+                OnConnectionStarted();
+            } catch (Exception ex) {
+                throw new InvalidOperationException("Cannot write to stream: failed to connect automatically.", ex);
+            }
+            
+            // Double check that the stream was initialized
+            if (_stream == null)
+            {
+                throw new InvalidOperationException("Stream is not initialized after connection attempt. Call StartAsync first.");
+            }
         }
         await _stream.WriteAsync(buffer);
     }

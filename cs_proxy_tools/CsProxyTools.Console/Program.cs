@@ -7,6 +7,9 @@ using System.Text;
 using System.Buffers;
 using System.Security.Cryptography.X509Certificates;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Net.Security;
+using System.Security.Authentication;
 
 var loggerFactory = LoggerFactory.Create(builder =>
 {
@@ -28,21 +31,76 @@ var targetHost = "localhost";
 var targetPort = 8080;
 
 // Try to load certificate from store, fallback to file if not found
-var certificate = await LoadCertificateFromStore("CN=localhost", StoreName.My, StoreLocation.LocalMachine);
-if (certificate == null)
+var serverCertificate = await LoadCertificateFromStore("CN=localhost", StoreName.My, StoreLocation.LocalMachine);
+if (serverCertificate == null)
 {
-    programLogger.LogWarning("Failed to load certificate from store. Falling back to file.");
+    programLogger.LogWarning("Failed to load server certificate from store. Falling back to file.");
     var certificatePath = "certificate.pfx";
     var certificatePassword = "password";
     try
     {
-        certificate = new X509Certificate2(certificatePath, certificatePassword);
+        serverCertificate = new X509Certificate2(certificatePath, certificatePassword);
     }
     catch (Exception ex)
     {
-        programLogger.LogError(ex, "Failed to load certificate from file {Path}", certificatePath);
-        throw new Exception("Failed to load certificate from both store and file");
+        programLogger.LogError(ex, "Failed to load server certificate from file {Path}", certificatePath);
+        throw new Exception("Failed to load server certificate from both store and file");
     }
+}
+
+// Try to load client certificate (for client authentication example)
+var clientCertificate = await LoadCertificateFromStore("CN=client", StoreName.My, StoreLocation.CurrentUser);
+if (clientCertificate == null)
+{
+    programLogger.LogWarning("Client certificate not found in store. Will create a self-signed one for demonstration.");
+    try
+    {
+        // This is for demonstration purposes only - in production, use proper certificates
+        using var rsa = System.Security.Cryptography.RSA.Create(2048);
+        var certReq = new System.Security.Cryptography.X509Certificates.CertificateRequest(
+            "CN=ClientDemo", 
+            rsa, 
+            System.Security.Cryptography.HashAlgorithmName.SHA256, 
+            System.Security.Cryptography.RSASignaturePadding.Pkcs1);
+            
+        // Add basic constraints
+        certReq.CertificateExtensions.Add(
+            new X509BasicConstraintsExtension(false, false, 0, true));
+            
+        // Add key usage
+        certReq.CertificateExtensions.Add(
+            new X509KeyUsageExtension(
+                X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment,
+                true));
+                
+        // Add enhanced key usage for client authentication
+        certReq.CertificateExtensions.Add(
+            new X509EnhancedKeyUsageExtension(
+                new OidCollection { new Oid("1.3.6.1.5.5.7.3.2") }, // Client Authentication
+                true));
+                
+        // Create certificate that's valid for 1 year
+        clientCertificate = certReq.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddDays(-1),
+            DateTimeOffset.UtcNow.AddYears(1));
+            
+        programLogger.LogInformation("Created self-signed client certificate with thumbprint: {Thumbprint}", 
+            clientCertificate.Thumbprint);
+    }
+    catch (Exception ex)
+    {
+        programLogger.LogError(ex, "Failed to create client certificate");
+        // We'll continue without client cert in this case
+    }
+}
+
+// Create a collection of trusted client certificates
+var trustedClientCerts = new X509Certificate2Collection();
+if (clientCertificate != null)
+{
+    trustedClientCerts.Add(clientCertificate);
+    programLogger.LogInformation("Added client certificate to trusted certificates: {Thumbprint}", 
+        clientCertificate.Thumbprint);
 }
 
 // Create TCP server
@@ -50,12 +108,39 @@ var tcpServer = new TcpServer(tcpServerLogger, "127.0.0.1", tcpServerPort);
 var tcpClient = new TcpClient(tcpClientLogger, targetHost, targetPort);
 
 // Create TLS server with the certificate
-var tlsServer = new TlsServer(tlsServerLogger, "127.0.0.1", tlsServerPort, certificate);
+// For demonstration, we're setting up two TLS servers:
+// 1. Standard TLS server without client cert requirement
+var tlsServer = new TlsServer(tlsServerLogger, "127.0.0.1", tlsServerPort, serverCertificate);
+
+// 2. TLS server with client certificate requirement on a different port
+var tlsServerWithClientAuth = new TlsServer(
+    tlsServerLogger, 
+    "127.0.0.1", 
+    tlsServerPort + 1, 
+    serverCertificate, 
+    requireClientCert: true, 
+    clientCertificates: trustedClientCerts,
+    clientCertValidator: (cert, chain, errors) => 
+    {
+        programLogger.LogInformation("Validating client certificate: {Subject}, Thumbprint: {Thumbprint}", 
+            cert.Subject, cert.Thumbprint);
+        return errors == SslPolicyErrors.None || 
+              (trustedClientCerts.Count > 0 && 
+               trustedClientCerts.Cast<X509Certificate2>().Any(c => c.Thumbprint == cert.Thumbprint));
+    });
+
+// Create regular TLS client
 var tlsClient = new TlsClient(tlsClientLogger, targetHost, targetPort, validateCertificate: false);
+
+// Create TLS client with client certificate for authentication
+var tlsClientWithCert = clientCertificate != null 
+    ? new TlsClient(tlsClientLogger, targetHost, tlsServerPort + 1, validateCertificate: false, clientCertificate: clientCertificate)
+    : new TlsClient(tlsClientLogger, targetHost, tlsServerPort + 1, validateCertificate: false);
 
 // Dictionary to store active proxy connections
 var tcpProxyConnections = new Dictionary<string, ProxyConnection>();
 var tlsProxyConnections = new Dictionary<string, ProxyConnection>();
+var tlsClientAuthProxyConnections = new Dictionary<string, ProxyConnection>();
 
 // Handle TCP server events
 tcpServer.ClientConnected += (sender, args) =>
@@ -105,6 +190,33 @@ tlsServer.DataReceived += async (sender, args) =>
     programLogger.LogInformation("TLS Received: {Txt}", txt);
     programLogger.LogInformation("TLS Received: {Hex}", hex);
     await tlsClient.WriteAsync(args.Data);
+};
+
+// Add handlers for the client-auth TLS server
+tlsServerWithClientAuth.ClientConnected += (sender, args) =>
+{
+    programLogger.LogInformation("Client-Auth TLS Client connected: {ClientId}", args.ConnectionId);
+    _ = HandleTlsClientAuthConnectionAsync(args.ConnectionId, tlsClientWithCert);
+};
+
+tlsServerWithClientAuth.ClientDisconnected += (sender, args) =>
+{
+    programLogger.LogInformation("Client-Auth TLS Client disconnected: {ClientId}", args.ConnectionId);
+    if (tlsClientAuthProxyConnections.TryGetValue(args.ConnectionId, out var connection))
+    {
+        connection.DisposeAsync().ConfigureAwait(false);
+        tlsClientAuthProxyConnections.Remove(args.ConnectionId);
+    }
+};
+
+tlsServerWithClientAuth.DataReceived += async (sender, args) =>
+{
+    programLogger.LogInformation("Client-Auth TLS Received {Length} bytes from {ClientId}", args.Data.Length, args.ConnectionId);
+    var txt = Encoding.UTF8.GetString(args.Data.ToArray()); 
+    var hex = BitConverter.ToString(args.Data.ToArray()).Replace("-", "");
+    programLogger.LogInformation("Client-Auth TLS Received: {Txt}", txt);
+    programLogger.LogInformation("Client-Auth TLS Received: {Hex}", hex);
+    await tlsClientWithCert.WriteAsync(args.Data);
 };
 
 // Handle TCP client events
@@ -158,6 +270,9 @@ await tcpServer.StartAsync();
 programLogger.LogInformation("Starting TLS server on port {Port}", tlsServerPort);
 await tlsServer.StartAsync();
 
+programLogger.LogInformation("Starting TLS server with client auth on port {Port}", tlsServerPort + 1);
+await tlsServerWithClientAuth.StartAsync();
+
 programLogger.LogInformation("Proxy servers started. Press any key to stop...");
 Console.ReadKey();
 
@@ -165,9 +280,12 @@ Console.ReadKey();
 programLogger.LogInformation("Stopping servers...");
 await tcpServer.StopAsync();
 await tlsServer.StopAsync();
+await tlsServerWithClientAuth.StopAsync();
 
 // Clean up all proxy connections
-foreach (var connection in tcpProxyConnections.Values.Concat(tlsProxyConnections.Values))
+foreach (var connection in tcpProxyConnections.Values
+    .Concat(tlsProxyConnections.Values)
+    .Concat(tlsClientAuthProxyConnections.Values))
 {
     await connection.DisposeAsync();
 }
@@ -200,7 +318,21 @@ async Task HandleTlsClientConnectionAsync(string clientId, TlsClient client)
     {
         programLogger.LogError(ex, "Error handling TLS client connection {ClientId}", clientId);
     }
-} 
+}
+
+async Task HandleTlsClientAuthConnectionAsync(string clientId, TlsClient client)
+{
+    try
+    {
+        await client.StartAsync();
+        var proxyConnection = new ProxyConnection(client, tlsServerWithClientAuth, programLogger, clientId);
+        tlsClientAuthProxyConnections[clientId] = proxyConnection;
+    }
+    catch (Exception ex)
+    {
+        programLogger.LogError(ex, "Error handling client-auth TLS client connection {ClientId}", clientId);
+    }
+}
 
 /// <summary>
 /// Loads a certificate from the Windows certificate store
