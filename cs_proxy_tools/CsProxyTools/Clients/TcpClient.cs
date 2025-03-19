@@ -1,4 +1,5 @@
 using System.Net.Sockets;
+using System.Net;  // Add this for Dns
 using System.IO.Pipelines;
 using CsProxyTools.Base;
 using CsProxyTools.Interfaces;
@@ -11,15 +12,16 @@ public class TcpClient : BaseConnection, IClient
 {
     private readonly string _host;
     private readonly int _port;
-    private readonly Socket _socket;
+    private Socket _socket;
     private NetworkStream? _stream;
     private readonly object _connectionLock = new object();
     private bool _isConnecting = false;
     private bool _isDisconnecting = false;
     
     // Timeout values
-    private const int ConnectionWaitTimeoutMs = 10000; // 10 seconds
+    private const int ConnectionWaitTimeoutMs = 30000; // 30 seconds
     private const int DisconnectionWaitTimeoutMs = 5000; // 5 seconds
+    private const int SocketConnectTimeoutMs = 15000; // 15 seconds for socket connect
 
     public TcpClient(ILogger logger, string host, int port) 
         : base(logger, Guid.NewGuid().ToString())
@@ -27,6 +29,8 @@ public class TcpClient : BaseConnection, IClient
         _host = host;
         _port = port;
         _socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
+        _socket.ReceiveTimeout = 30000; // 30 seconds
+        _socket.SendTimeout = 30000; // 30 seconds
     }
 
     protected override async Task StartConnectionAsync()
@@ -71,8 +75,102 @@ public class TcpClient : BaseConnection, IClient
         try
         {
             _logger.LogDebug("TcpClient: Starting connection to {Host}:{Port}", _host, _port);
-            await _socket.ConnectAsync(_host, _port);
-            _logger.LogDebug("TcpClient: Socket connected to {Host}:{Port}", _host, _port);
+            
+            // Ensure previous socket is closed and create a new one for this connection attempt
+            if (_socket != null && _socket.Connected)
+            {
+                try
+                {
+                    _socket.Close();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "TcpClient: Error closing existing socket before reconnection");
+                }
+            }
+            
+            // Create a new socket for this connection attempt to avoid reusing a potentially bad socket
+            if (_socket != null)
+            {
+                try 
+                {
+                    _socket.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "TcpClient: Error disposing existing socket");
+                }
+            }
+            
+            _socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
+            _socket.ReceiveTimeout = 30000; // 30 seconds
+            _socket.SendTimeout = 30000; // 30 seconds
+            
+            // Create a connect task with timeout
+            using var timeoutCts = new CancellationTokenSource(SocketConnectTimeoutMs);
+            
+            // Try to resolve hostname first to log IP address
+            try 
+            {
+                var addresses = await Dns.GetHostAddressesAsync(_host);
+                if (addresses.Length > 0)
+                {
+                    _logger.LogDebug("TcpClient: Resolved {Host} to {IPAddress}", _host, 
+                        string.Join(", ", addresses.Select(a => a.ToString())));
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "TcpClient: Failed to resolve hostname {Host}, will try connecting directly", _host);
+            }
+            
+            try
+            {
+                // Use a linked token source to combine our operation timeout with the general cancellation token
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                    timeoutCts.Token, _cancellationTokenSource.Token);
+                
+                var connectTask = _socket.ConnectAsync(_host, _port, linkedCts.Token);
+                await connectTask;
+                
+                if (!_socket.Connected)
+                {
+                    _logger.LogWarning("TcpClient: Socket connect completed but socket is not connected");
+                    throw new TimeoutException($"Failed to connect to {_host}:{_port} - socket did not report as connected");
+                }
+                
+                _logger.LogDebug("TcpClient: Socket connected to {Host}:{Port}", _host, _port);
+            }
+            catch (OperationCanceledException)
+            {
+                if (timeoutCts.IsCancellationRequested)
+                {
+                    _logger.LogError("TcpClient: Connect operation timed out after {TimeoutMs}ms", SocketConnectTimeoutMs);
+                    throw new TimeoutException($"Connect operation to {_host}:{_port} timed out after {SocketConnectTimeoutMs}ms");
+                }
+                if (_cancellationTokenSource.IsCancellationRequested)
+                {
+                    _logger.LogDebug("TcpClient: Connect operation was canceled");
+                    throw new OperationCanceledException("Connection was canceled");
+                }
+                throw;
+            }
+            catch (SocketException socketEx)
+            {
+                // Convert common socket errors to more user-friendly timeout exceptions
+                if (socketEx.SocketErrorCode == SocketError.TimedOut ||
+                    socketEx.SocketErrorCode == SocketError.ConnectionRefused ||
+                    socketEx.SocketErrorCode == SocketError.HostUnreachable ||
+                    socketEx.SocketErrorCode == SocketError.NetworkUnreachable)
+                {
+                    _logger.LogError(socketEx, "TcpClient: Socket error connecting to {Host}:{Port} - {ErrorCode}", 
+                        _host, _port, socketEx.SocketErrorCode);
+                    throw new TimeoutException($"Failed to connect to {_host}:{_port}: {socketEx.Message}", socketEx);
+                }
+                _logger.LogError(socketEx, "TcpClient: Socket error connecting to {Host}:{Port} - {ErrorCode}", 
+                    _host, _port, socketEx.SocketErrorCode);
+                throw;
+            }
             
             // Create the stream - no lock needed since we've set _isConnecting flag
             _stream = new NetworkStream(_socket);
@@ -85,6 +183,21 @@ public class TcpClient : BaseConnection, IClient
         catch (Exception ex)
         {
             _logger.LogError(ex, "TcpClient: Failed to connect to {Host}:{Port}", _host, _port);
+            
+            // Try to close the socket if there was an error
+            try
+            {
+                if (_socket != null && _socket.Connected)
+                {
+                    _socket.Close();
+                    _logger.LogDebug("TcpClient: Closed socket after connection error");
+                }
+            }
+            catch (Exception closeEx)
+            {
+                _logger.LogWarning(closeEx, "TcpClient: Error closing socket after connection error");
+            }
+            
             throw;
         }
         finally
@@ -199,6 +312,9 @@ public class TcpClient : BaseConnection, IClient
         {
             _logger.LogDebug("TcpClient: Stopping connection");
             
+            // Cancel ongoing operations
+            _cancellationTokenSource.Cancel();
+            
             // Safely capture and clear stream reference
             var streamToClose = _stream;
             _stream = null;
@@ -223,7 +339,13 @@ public class TcpClient : BaseConnection, IClient
                 _logger.LogDebug("TcpClient: Closing socket");
                 try
                 {
-                    _socket.Close();
+                    // Use a combination of shutdown and close for cleaner socket termination
+                    _socket.Shutdown(SocketShutdown.Both);
+                    _socket.Close(1000); // Give it 1 second to close gracefully
+                }
+                catch (SocketException ex)
+                {
+                    _logger.LogWarning(ex, "TcpClient: Socket exception when closing socket: {ErrorCode}", ex.SocketErrorCode);
                 }
                 catch (Exception ex)
                 {
@@ -241,6 +363,26 @@ public class TcpClient : BaseConnection, IClient
 
     protected override async Task WriteDataAsync(ReadOnlyMemory<byte> buffer)
     {
+        // Add error handling for disconnected socket
+        if (!_isConnected && _socket != null && !_socket.Connected) 
+        {
+            _logger.LogDebug("TcpClient: Attempting to reconnect before writing data");
+            try {
+                await StartConnectionAsync();
+                // Ensure the connection started event is triggered
+                OnConnectionStarted();
+                _logger.LogDebug("TcpClient: Successfully reconnected before writing data");
+            } catch (Exception ex) {
+                _logger.LogError(ex, "TcpClient: Failed to reconnect before writing data");
+                throw new InvalidOperationException("Cannot write to socket: failed to reconnect", ex);
+            }
+        }
+        else if (_socket == null || !_socket.Connected)
+        {
+            _logger.LogWarning("TcpClient: Cannot write data - socket is not connected");
+            throw new InvalidOperationException("Cannot write to socket: socket is not connected");
+        }
+        
         // Check if stream is available
         if (_stream == null)
         {

@@ -8,6 +8,7 @@ using CsProxyTools.Interfaces;
 using Microsoft.Extensions.Logging;
 using System.Security.Authentication;
 using CsProxyTools.Helpers;
+using System.ComponentModel; // For Win32Exception
 
 namespace CsProxyTools.Servers;
 
@@ -17,7 +18,7 @@ public class TlsServer : BaseConnection, IServer
     private readonly int _port;
     private readonly string? _certificatePath;
     private readonly string? _certificatePassword;
-    private readonly Socket _listener;
+    private Socket _listener;
     private readonly List<SslStream> _clients;
     private readonly object _clientsLock = new();
     private X509Certificate2? _certificate;
@@ -38,7 +39,7 @@ public class TlsServer : BaseConnection, IServer
         _port = port;
         _certificatePath = certificatePath;
         _certificatePassword = certificatePassword;
-        _listener = new Socket(SocketType.Stream, ProtocolType.Tcp);
+        _listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         _clients = new List<SslStream>();
         _externalCertificate = false;
         _requireClientCert = requireClientCert;
@@ -54,7 +55,7 @@ public class TlsServer : BaseConnection, IServer
         _port = port;
         _certificatePath = null;
         _certificatePassword = null;
-        _listener = new Socket(SocketType.Stream, ProtocolType.Tcp);
+        _listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         _clients = new List<SslStream>();
         _certificate = certificate;
         _externalCertificate = true;
@@ -70,9 +71,49 @@ public class TlsServer : BaseConnection, IServer
             _certificate = new X509Certificate2(_certificatePath, _certificatePassword);
         }
         
-        _listener.Bind(new IPEndPoint(IPAddress.Parse(_host), _port));
+        // Parse the host and ensure we use IPv4 only
+        IPAddress bindAddress;
+        if (_host == "0.0.0.0" || _host == "127.0.0.1" || _host == "localhost" || _host == "::1")
+        {
+            // Use explicit IPv4 loopback for localhost
+            bindAddress = IPAddress.Parse("127.0.0.1");
+            _logger.LogDebug("TlsServer: Using IPv4 loopback address (127.0.0.1) for binding");
+        }
+        else if (_host == "::" || _host == "0:0:0:0:0:0:0:0")
+        {
+            // Use explicit IPv4 any address instead of IPv6 any
+            bindAddress = IPAddress.Any;
+            _logger.LogDebug("TlsServer: Using IPv4 any address (0.0.0.0) for binding");
+        }
+        else if (IPAddress.TryParse(_host, out var parsedAddress))
+        {
+            if (parsedAddress.AddressFamily == AddressFamily.InterNetworkV6)
+            {
+                // Convert IPv6 to equivalent IPv4 if possible, otherwise use IPv4 any
+                _logger.LogWarning("TlsServer: IPv6 address specified, converting to IPv4 for consistency");
+                bindAddress = IPAddress.Any;
+            }
+            else
+            {
+                bindAddress = parsedAddress;
+            }
+        }
+        else
+        {
+            // Default to IPv4 any address if parsing fails
+            _logger.LogWarning("TlsServer: Invalid address format: {Host}, using IPv4 any address (0.0.0.0)", _host);
+            bindAddress = IPAddress.Any;
+        }
+        
+        // Create a new IPv4 socket
+        _listener.Close();
+        _listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        
+        // Bind to the IPv4 address
+        _listener.Bind(new IPEndPoint(bindAddress, _port));
         _listener.Listen(128);
         IsRunning = true;
+        _logger.LogInformation("TlsServer: Listening on {Address}:{Port} (IPv4)", bindAddress, _port);
         _ = AcceptClientsAsync();
     }
 
@@ -231,13 +272,50 @@ public class TlsServer : BaseConnection, IServer
                 handshakeTimeoutCts.Token, 
                 _cancellationTokenSource.Token);
             
+            // Try different certificate format options if needed
+            X509Certificate2? effectiveCert = _certificate;
+            
+            // Export the certificate with private key to try different format
+            try
+            {
+                if (_certificate?.HasPrivateKey == true)
+                {
+                    _logger.LogDebug("TLS Server: Using certificate with private key for client {ClientIpPort}:{ClientId}", 
+                        clientIpPort, clientId);
+                    _logger.LogDebug("TLS Server: Certificate subject: {Subject}, Issuer: {Issuer}, HasPrivateKey: {HasPrivateKey}",
+                        _certificate.Subject, _certificate.Issuer, _certificate.HasPrivateKey);
+                    
+                    // Check if this might be a browser connection sending plain HTTP instead of initiating TLS handshake
+                    var initialByte = new byte[1];
+                    if (stream.DataAvailable && stream.Read(initialByte, 0, 1) == 1)
+                    {
+                        if (initialByte[0] == 'G' || initialByte[0] == 'P' || initialByte[0] == 'H') // GET, POST, HEAD, etc.
+                        {
+                            _logger.LogWarning("TLS Server: Client appears to be sending plain HTTP rather than initiating TLS handshake");
+                            throw new InvalidOperationException("Client appears to be sending plain HTTP rather than initiating TLS handshake");
+                        }
+                    }
+                }
+                else
+                {
+                    _logger.LogWarning("TLS Server: Certificate does not have private key accessible. Subject: {Subject}, Thumbprint: {Thumbprint}",
+                        _certificate?.Subject, _certificate?.Thumbprint);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "TLS Server: Error processing certificate for client {ClientIpPort}:{ClientId}", 
+                    clientIpPort, clientId);
+                throw;
+            }
+
             // Configure comprehensive server options
             var sslServerOptions = new SslServerAuthenticationOptions
             {
-                ServerCertificate = _certificate,
+                ServerCertificate = effectiveCert,
                 ClientCertificateRequired = _requireClientCert,
                 RemoteCertificateValidationCallback = ValidateClientCertificate,
-                EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12,
+                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
                 CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
                 AllowRenegotiation = true
             };
@@ -246,6 +324,12 @@ public class TlsServer : BaseConnection, IServer
             try 
             {
                 await sslStream.AuthenticateAsServerAsync(sslServerOptions, combinedCts.Token);
+                
+                // Log successful handshake details
+                _logger.LogInformation("TLS Server: Successful handshake with client {ClientIpPort}:{ClientId} using {Protocol}",
+                    clientIpPort, clientId, sslStream.SslProtocol);
+                _logger.LogDebug("TLS Server: Cipher: {Cipher}, Strength: {Strength} bits",
+                    sslStream.CipherAlgorithm, sslStream.CipherStrength);
             }
             catch (OperationCanceledException ex)
             {
@@ -257,12 +341,45 @@ public class TlsServer : BaseConnection, IServer
             {
                 _logger.LogWarning("TlsServer: TLS handshake IO error for client {ClientIpPort}:{ClientId}: {Message}", 
                     clientIpPort, clientId, ex.Message);
+                
+                // Get inner exception details for better diagnosis
+                if (ex.InnerException != null)
+                {
+                    _logger.LogWarning("TlsServer: Inner exception: {Type} - {Message}, HResult: 0x{HResult:X8}", 
+                        ex.InnerException.GetType().Name, ex.InnerException.Message, ex.InnerException.HResult);
+                }
+                throw;
+            }
+            catch (AuthenticationException ex)
+            {
+                _logger.LogWarning("TlsServer: TLS authentication failed for client {ClientIpPort}:{ClientId}: {Message}", 
+                    clientIpPort, clientId, ex.Message);
+                
+                // Get inner exception details for better diagnosis
+                if (ex.InnerException != null)
+                {
+                    _logger.LogWarning("TlsServer: Inner exception: {Type} - {Message}, HResult: 0x{HResult:X8}", 
+                        ex.InnerException.GetType().Name, ex.InnerException.Message, ex.InnerException.HResult);
+                    
+                    if (ex.InnerException is Win32Exception win32Ex)
+                    {
+                        _logger.LogWarning("TlsServer: Win32 error code: 0x{ErrorCode:X8} - {NativeErrorCode}", 
+                            win32Ex.ErrorCode, win32Ex.NativeErrorCode);
+                    }
+                }
                 throw;
             }
             catch (Exception ex)
             {
                 _logger.LogWarning("TlsServer: TLS handshake error for client {ClientIpPort}:{ClientId}: {Message}", 
                     clientIpPort, clientId, ex.Message);
+                
+                // Get inner exception details for better diagnosis
+                if (ex.InnerException != null)
+                {
+                    _logger.LogWarning("TlsServer: Inner exception: {Type} - {Message}, HResult: 0x{HResult:X8}", 
+                        ex.InnerException.GetType().Name, ex.InnerException.Message, ex.InnerException.HResult);
+                }
                 throw;
             }
             

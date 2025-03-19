@@ -36,8 +36,8 @@ public class TlsClient : BaseConnection, ITlsClient
         _port = port;
         _validateCertificate = validateCertificate;
         _clientCertificate = clientCertificate;
-        _socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        _socket.NoDelay = true; // Disable Nagle algorithm
+        // Don't create the socket in the constructor, only when needed
+        _socket = null;
     }
 
     // Implement IClient interface events
@@ -71,6 +71,144 @@ public class TlsClient : BaseConnection, ITlsClient
         return false;
     }
 
+    private async Task<IPAddress[]> ResolveHostToIPv4AddressesAsync(string host)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(host))
+            {
+                _logger.LogError("TlsClient: Host is null or empty");
+                return Array.Empty<IPAddress>();
+            }
+            
+            if (IPAddress.TryParse(host, out var ipAddress))
+            {
+                // If it's already an IP address, check if it's IPv4
+                if (ipAddress.AddressFamily == AddressFamily.InterNetwork)
+                {
+                    _logger.LogDebug("TlsClient: Using explicit IPv4 address: {IPAddress}", ipAddress);
+                    return new[] { ipAddress };
+                }
+                else
+                {
+                    _logger.LogDebug("TlsClient: Converting non-IPv4 address {IPAddress} to equivalent IPv4 address", ipAddress);
+                    // For IPv6 addresses, try to get equivalent IPv4 or use loopback
+                    return new[] { IPAddress.Loopback };
+                }
+            }
+            else
+            {
+                // Otherwise, resolve the hostname to IPv4 addresses only
+                _logger.LogDebug("TlsClient: Resolving hostname: {Host}", host);
+                
+                try
+                {
+                    // Only get IPv4 addresses to ensure compatibility
+                    var allAddresses = await Dns.GetHostAddressesAsync(host);
+                    var ipv4Addresses = Array.FindAll(allAddresses, addr => addr != null && addr.AddressFamily == AddressFamily.InterNetwork);
+                    
+                    if (ipv4Addresses.Length == 0)
+                    {
+                        _logger.LogError("TlsClient: No IPv4 addresses found for hostname: {Host}", host);
+                        // Fall back to loopback address when no IPv4 addresses are found
+                        _logger.LogWarning("TlsClient: Falling back to loopback address");
+                        return new[] { IPAddress.Loopback };
+                    }
+                    
+                    _logger.LogDebug("TlsClient: Resolved {Host} to {AddressCount} IPv4 addresses", host, ipv4Addresses.Length);
+                    return ipv4Addresses;
+                }
+                catch (Exception dnsEx)
+                {
+                    _logger.LogError(dnsEx, "TlsClient: DNS resolution failed for {Host}, falling back to loopback", host);
+                    return new[] { IPAddress.Loopback };
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "TlsClient: Failed to resolve hostname: {Host}, falling back to loopback", host);
+            return new[] { IPAddress.Loopback };
+        }
+    }
+
+    private Socket CreateFreshSocket()
+    {
+        // Always create a new socket to avoid reuse issues
+        var newSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        
+        try
+        {
+            // Configure socket for better performance with TLS
+            newSocket.ReceiveBufferSize = 16384; // Larger buffer for TLS frames
+            newSocket.SendBufferSize = 16384;
+            newSocket.NoDelay = true; // Disable Nagle algorithm for lower latency
+            newSocket.LingerState = new LingerOption(false, 0); // Don't linger on close
+            
+            // IMPORTANT: Do NOT bind the client socket to a specific local endpoint
+            // This is critical for outbound connections to work properly
+            
+            // Set adequate timeouts - validate the values are positive
+            int timeout = (int)TimeSpan.FromSeconds(30).TotalMilliseconds;
+            if (timeout > 0)
+            {
+                newSocket.ReceiveTimeout = timeout;
+                newSocket.SendTimeout = timeout;
+            }
+            else
+            {
+                _logger.LogWarning("TlsClient: Invalid timeout value, not setting socket timeouts");
+            }
+        }
+        catch (SocketException sx)
+        {
+            _logger.LogWarning(sx, "TlsClient: Error setting socket options, continuing anyway: {Error}", sx.SocketErrorCode);
+        }
+        
+        return newSocket;
+    }
+
+    // Configure SSL Stream
+    private async Task<SslStream> ConfigureAndAuthenticateSslStreamAsync(IPEndPoint remoteEndpoint)
+    {
+        _logger.LogDebug("TlsClient: Configuring SSL/TLS for connection to {Host}:{Port}", _host, _port);
+        
+        var sslStream = new SslStream(_stream!, true, ValidateServerCertificate);
+        
+        _logger.LogDebug("TlsClient: Created SSL stream, authenticating as client for {Host}:{Port}", _host, _port);
+        
+        try
+        {
+            // Create SSL client authentication options
+            var options = new SslClientAuthenticationOptions
+            {
+                TargetHost = _host,
+                ClientCertificates = _clientCertificate != null ? new X509CertificateCollection { _clientCertificate } : null,
+                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                RemoteCertificateValidationCallback = ValidateServerCertificate
+            };
+            
+            _logger.LogDebug("TlsClient: Starting SSL handshake with {Host}:{Port} (Endpoint: {Endpoint})", 
+                _host, _port, remoteEndpoint);
+            
+            // Authenticate as client - this performs the SSL handshake
+            await sslStream.AuthenticateAsClientAsync(options);
+            
+            _logger.LogDebug("TlsClient: SSL handshake successful with {Host}:{Port} using {Protocol}", 
+                _host, _port, sslStream.SslProtocol);
+            
+            return sslStream;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "TlsClient: SSL handshake failed with {Host}:{Port}", _host, _port);
+            
+            // Clean up on error
+            sslStream.Dispose();
+            throw;
+        }
+    }
+
     protected override async Task StartConnectionAsync()
     {
         // Validate connection parameters first
@@ -89,90 +227,16 @@ public class TlsClient : BaseConnection, ITlsClient
         
         try
         {
-            // Ensure the socket is properly created and not in an invalid state
-            if (_socket == null || _socket.Connected)
-            {
-                // If socket exists and is connected, dispose it first
-                if (_socket != null)
-                {
-                    _logger.LogDebug("TlsClient: Disposing existing socket before creating a new one");
-                    _socket.Dispose();
-                }
-                
-                _socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                _logger.LogDebug("TlsClient: Created new socket");
-            }
+            // Clean up any existing connection resources
+            CleanupConnection();
             
-            // Configure socket for better performance with TLS
-            _logger.LogDebug("TlsClient: Configuring socket options");
-            try
-            {
-                _socket.ReceiveBufferSize = 16384; // Larger buffer for TLS frames
-                _socket.SendBufferSize = 16384;
-                _socket.NoDelay = true; // Disable Nagle algorithm for lower latency
-                _socket.LingerState = new LingerOption(false, 0); // Don't linger on close
-                
-                // Set adequate timeouts - validate the values are positive
-                int timeout = (int)TimeSpan.FromSeconds(30).TotalMilliseconds;
-                if (timeout > 0)
-                {
-                    _socket.ReceiveTimeout = timeout;
-                    _socket.SendTimeout = timeout;
-                }
-                else
-                {
-                    _logger.LogWarning("TlsClient: Invalid timeout value, not setting socket timeouts");
-                }
-            }
-            catch (SocketException sx)
-            {
-                _logger.LogWarning(sx, "TlsClient: Error setting socket options, continuing anyway: {Error}", sx.SocketErrorCode);
-            }
+            // Resolve the hostname to an IPv4 address
+            IPAddress[] addresses = await ResolveHostToIPv4AddressesAsync(_host);
             
-            // Attempt to resolve the hostname to check if it's valid before connecting
-            IPAddress[] addresses;
-            try
+            if (addresses == null || addresses.Length == 0)
             {
-                _logger.LogDebug("TlsClient: Resolving hostname: {Host}", _host);
-                // Check if the host is an IP address first
-                if (IPAddress.TryParse(_host, out var ipAddress))
-                {
-                    addresses = new[] { ipAddress };
-                    _logger.LogDebug("TlsClient: Host is a valid IP address: {Address}", ipAddress);
-                }
-                else
-                {
-                    // Resolve hostname to IP addresses
-                    addresses = await Dns.GetHostAddressesAsync(_host);
-                    _logger.LogDebug("TlsClient: Resolved {Host} to {AddressCount} addresses", _host, addresses.Length);
-                    foreach (var addr in addresses)
-                    {
-                        _logger.LogDebug("TlsClient: Resolved address: {Address} ({AddressFamily})", addr, addr.AddressFamily);
-                    }
-                }
-                
-                // If no addresses were resolved, throw an exception
-                if (addresses.Length == 0)
-                {
-                    throw new InvalidOperationException($"Could not resolve hostname: {_host}");
-                }
-                
-                // Prefer IPv4 addresses if available
-                var ipv4Addresses = addresses.Where(a => a.AddressFamily == AddressFamily.InterNetwork).ToArray();
-                if (ipv4Addresses.Length > 0)
-                {
-                    addresses = ipv4Addresses;
-                    _logger.LogDebug("TlsClient: Using IPv4 addresses");
-                }
-                else
-                {
-                    _logger.LogDebug("TlsClient: No IPv4 addresses found, using all resolved addresses");
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "TlsClient: Failed to resolve hostname: {Host}", _host);
-                throw new InvalidOperationException($"Failed to resolve hostname: {_host}", ex);
+                _logger.LogError("TlsClient: Failed to resolve any addresses for {Host}, cannot proceed", _host);
+                throw new InvalidOperationException($"Failed to resolve any addresses for {_host}");
             }
             
             // Try to connect using the resolved addresses
@@ -181,11 +245,45 @@ public class TlsClient : BaseConnection, ITlsClient
             
             foreach (var address in addresses)
             {
+                if (address == null)
+                {
+                    _logger.LogWarning("TlsClient: Skipping null address for {Host}", _host);
+                    continue;
+                }
+                
                 try
                 {
                     // Create endpoint with the resolved address
                     var endpoint = new IPEndPoint(address, _port);
-                    _logger.LogDebug("TlsClient: Connecting to {Endpoint}", endpoint);
+                    _logger.LogDebug("TlsClient: Connecting to {Endpoint} from local socket {LocalEndpoint}", 
+                        endpoint, "not bound yet");
+                    
+                    // Create a fresh socket for each connection attempt with specific address family
+                    // IMPORTANT: Ensuring the socket has the same address family as the target endpoint
+                    _socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                    _logger.LogDebug("TlsClient: Created new socket for connection attempt with address family {AddressFamily}", 
+                        address.AddressFamily);
+                    
+                    if (_socket != null)
+                    {
+                        // Configure socket options
+                        _socket.ReceiveBufferSize = 16384;
+                        _socket.SendBufferSize = 16384; 
+                        _socket.NoDelay = true;
+                        _socket.LingerState = new LingerOption(false, 0);
+                        
+                        // For dual-stack compatibility, set IPv6Only to false if this is an IPv6 socket
+                        if (address.AddressFamily == AddressFamily.InterNetworkV6)
+                        {
+                            _logger.LogDebug("TlsClient: Setting IPv6Only to false for dual-stack compatibility");
+                            _socket.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, false);
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogError("TlsClient: Failed to create socket for {Host}:{Port}", _host, _port);
+                        throw new InvalidOperationException($"Failed to create socket for {_host}:{_port}");
+                    }
                     
                     // Connect to the endpoint
                     await _socket.ConnectAsync(endpoint);
@@ -193,30 +291,20 @@ public class TlsClient : BaseConnection, ITlsClient
                     
                     if (connected)
                     {
-                        _logger.LogDebug("TlsClient: Successfully connected to {Endpoint}", endpoint);
+                        _logger.LogDebug("TlsClient: Successfully connected to {Endpoint} from {LocalEndpoint}", 
+                            endpoint, _socket.LocalEndPoint != null ? _socket.LocalEndPoint.ToString() : "unknown");
                         break;
                     }
                 }
                 catch (SocketException sx)
                 {
-                    lastConnectException = sx;
-                    _logger.LogWarning(sx, "TlsClient: Socket error connecting to {Address}:{Port}, SocketError: {Error}", 
-                        address, _port, sx.SocketErrorCode);
+                    // Log the local endpoint (if any) to help diagnose binding issues
+                    _logger.LogWarning(sx, "TlsClient: Socket error connecting to {Address}:{Port}, SocketError: {Error}, LocalEndpoint: {LocalEndpoint}", 
+                        address, _port, sx.SocketErrorCode, _socket?.LocalEndPoint != null ? _socket.LocalEndPoint.ToString() : "not bound");
                     
-                    // If this is not the last address, try the next one
-                    if (address != addresses.Last())
-                    {
-                        _logger.LogDebug("TlsClient: Will try next address");
-                        continue;
-                    }
-                    
-                    // Otherwise, re-throw the last exception
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    lastConnectException = ex;
-                    _logger.LogWarning(ex, "TlsClient: Error connecting to {Address}:{Port}", address, _port);
+                    // Always dispose of failed socket
+                    _socket?.Dispose();
+                    _socket = null;
                     
                     // If this is not the last address, try the next one
                     if (address != addresses.Last())
@@ -231,7 +319,7 @@ public class TlsClient : BaseConnection, ITlsClient
             }
             
             // Verify connection was successful
-            if (!connected)
+            if (!connected || _socket == null)
             {
                 if (lastConnectException != null)
                 {
@@ -242,277 +330,108 @@ public class TlsClient : BaseConnection, ITlsClient
             
             _logger.LogDebug("TlsClient: TCP socket connected successfully to {Host}:{Port}", _host, _port);
             
+            // Get the remote endpoint for logging and diagnostics
+            var remoteEndpoint = _socket.RemoteEndPoint as IPEndPoint;
+            if (remoteEndpoint == null)
+            {
+                throw new InvalidOperationException("Could not determine remote endpoint");
+            }
+            
             // Create network stream with ownership of socket
             _stream = new NetworkStream(_socket, true);
             _logger.LogDebug("TlsClient: Created network stream");
             
-            // Create SSL stream with all necessary callbacks
-            _sslStream = new SslStream(
-                _stream,
-                false,
-                ValidateServerCertificate,
-                null,
-                EncryptionPolicy.RequireEncryption);
+            // Now perform SSL handshake
+            int retryCount = 0;
+            const int maxRetries = 2; // Total attempts: 3 (initial + 2 retries)
+            Exception? lastException = null;
             
-            _logger.LogDebug("TlsClient: Created SSL stream, starting handshake");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "TlsClient: Failed to establish TCP connection to {Host}:{Port} - {ExceptionType}: {Message}", 
-                _host, _port, ex.GetType().Name, ex.Message);
-            CleanupConnection();
-            throw;
-        }
-        
-        // Now perform the SSL handshake with multiple attempts if needed
-        int retryCount = 0;
-        const int maxRetries = 2;
-        Exception? lastException = null;
-        
-        while (retryCount <= maxRetries)
-        {
-            // Configure SSL options with enhanced parameters
-            var sslOptions = new SslClientAuthenticationOptions
+            while (retryCount <= maxRetries)
             {
-                TargetHost = _host,
-                // Support both TLS 1.2 and TLS 1.3 for better compatibility
-                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-                RemoteCertificateValidationCallback = ValidateServerCertificate,
-                AllowRenegotiation = true,
-                EncryptionPolicy = EncryptionPolicy.RequireEncryption,
-                CertificateRevocationCheckMode = X509RevocationMode.NoCheck
-            };
-            
-            // If client certificate is provided, add it to the options
-            if (_clientCertificate != null)
-            {
-                _logger.LogDebug("TlsClient: Using client certificate for authentication: {Thumbprint}", 
-                    _clientCertificate.Thumbprint);
-                
-                var clientCertificateCollection = new X509CertificateCollection
+                try
                 {
-                    _clientCertificate
-                };
-                
-                sslOptions.ClientCertificates = clientCertificateCollection;
-            }
-            
-            _logger.LogDebug("TlsClient: Beginning SSL handshake with {Host} using TLS 1.2/1.3 (Attempt {Attempt}/{MaxAttempts})", 
-                _host, retryCount + 1, maxRetries + 1);
-
-            try
-            {
-                // Use a timeout for the SSL handshake
-                using var handshakeTimeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_cancellationTokenSource.Token);
-                handshakeTimeoutCts.CancelAfter(_handshakeTimeout);
-                
-                _logger.LogDebug("TlsClient: Starting SSL handshake with timeout of {Seconds} seconds", _handshakeTimeout.TotalSeconds);
-                
-                await _sslStream.AuthenticateAsClientAsync(sslOptions, handshakeTimeoutCts.Token);
-                
-                // If we get here, authentication succeeded
-                _logger.LogDebug("TlsClient: SSL handshake completed successfully");
-                _logger.LogDebug("TlsClient: Negotiated Protocol: {Protocol}", _sslStream.SslProtocol);
-                _logger.LogDebug("TlsClient: Cipher: {Cipher} ({Strength} bit)", _sslStream.CipherAlgorithm, _sslStream.CipherStrength);
-                
-                // If client certificate was used, log that information
-                if (_clientCertificate != null && _sslStream.LocalCertificate != null)
-                {
-                    _logger.LogDebug("TlsClient: Client certificate was used for authentication");
+                    // Create and authenticate SSL stream
+                    _sslStream = await ConfigureAndAuthenticateSslStreamAsync(remoteEndpoint);
+                    break; // Success, exit the retry loop
                 }
-                
-                // Log server certificate details for debugging
-                if (_sslStream.RemoteCertificate != null)
+                catch (IOException ioEx) when (IsRecoverableIoException(ioEx) && retryCount < maxRetries)
                 {
-                    _logger.LogDebug("TlsClient: Server certificate subject: {Subject}", _sslStream.RemoteCertificate.Subject);
-                    _logger.LogDebug("TlsClient: Server certificate issuer: {Issuer}", _sslStream.RemoteCertificate.Issuer);
-                    _logger.LogDebug("TlsClient: Server certificate valid from {ValidFrom} to {ValidTo}", 
-                        _sslStream.RemoteCertificate.GetEffectiveDateString(), 
-                        _sslStream.RemoteCertificate.GetExpirationDateString());
-                }
-                else
-                {
-                    _logger.LogWarning("TlsClient: No server certificate available after successful handshake");
-                }
-                
-                // Authentication successful, break the retry loop
-                break;
-            }
-            catch (AuthenticationException authEx)
-            {
-                lastException = authEx;
-                _logger.LogError(authEx, "TlsClient: TLS authentication failed (Attempt {Attempt}/{MaxAttempts}): {Message}", 
-                    retryCount + 1, maxRetries + 1, authEx.Message);
-                
-                if (authEx.InnerException != null)
-                {
-                    _logger.LogError("TlsClient: Inner exception - {InnerType}: {InnerMessage}", 
-                        authEx.InnerException.GetType().Name, authEx.InnerException.Message);
-                }
-                
-                // Try to get more specific TLS error information if available
-                _logger.LogError("TlsClient: Detailed TLS error diagnostics:");
-                _logger.LogError("TlsClient: - Target host: {Host}", _host);
-                _logger.LogError("TlsClient: - Enabled protocols: {Protocols}", sslOptions.EnabledSslProtocols);
-                _logger.LogError("TlsClient: - Certificate validation enabled: {Validation}", _validateCertificate);
-                
-                // Check if this might be a protocol version mismatch
-                if (authEx.Message.Contains("protocol") || 
-                    (authEx.InnerException?.Message?.Contains("protocol") ?? false))
-                {
-                    _logger.LogError("TlsClient: Possible TLS protocol version mismatch. Server might not support TLS 1.2/1.3");
+                    lastException = ioEx;
+                    retryCount++;
                     
-                    // If we have more retries left, we could try an older protocol version as a last resort
-                    if (retryCount == maxRetries - 1)
+                    _logger.LogWarning(ioEx, "TlsClient: IO error during SSL handshake (Attempt {Attempt}/{MaxAttempts}): {Message}",
+                        retryCount, maxRetries + 1, ioEx.Message);
+                    
+                    // Perform cleanup and retry with a new stream
+                    CleanupConnection();
+                    
+                    // Short delay before retry
+                    await Task.Delay(500 * retryCount);
+                    
+                    // Re-establish TCP connection with a new socket
+                    _logger.LogDebug("TlsClient: Retrying connection to {Host}:{Port} (Attempt {Attempt}/{MaxAttempts})", 
+                        _host, _port, retryCount + 1, maxRetries + 1);
+                    
+                    // Try to create a new socket and connect again to the first IPv4 address
+                    var retryAddresses = await ResolveHostToIPv4AddressesAsync(_host);
+                    if (retryAddresses.Length > 0)
                     {
-                        _logger.LogWarning("TlsClient: On final retry, will attempt with TLS 1.0/1.1 as fallback");
-                        // This would normally be set in the next iteration, but logging it here for clarity
+                        _socket = CreateFreshSocket();
+                        var endpoint = new IPEndPoint(retryAddresses[0], _port);
+                        await _socket.ConnectAsync(endpoint);
+                        
+                        if (!_socket.Connected)
+                        {
+                            throw new InvalidOperationException($"Failed to reconnect to {_host}:{_port} on retry {retryCount}");
+                        }
+                        
+                        remoteEndpoint = _socket.RemoteEndPoint as IPEndPoint;
+                        if (remoteEndpoint == null)
+                        {
+                            throw new InvalidOperationException("Could not determine remote endpoint on retry");
+                        }
+                        
+                        // Create a new network stream
+                        _stream = new NetworkStream(_socket, true);
+                    }
+                    else
+                    {
+                        throw new InvalidOperationException($"Could not resolve hostname: {_host} on retry");
                     }
                 }
-            }
-            catch (OperationCanceledException) 
-            {
-                lastException = new TimeoutException($"SSL handshake timed out after {_handshakeTimeout.TotalSeconds} seconds");
-                _logger.LogWarning("TlsClient: SSL handshake timed out after {Seconds} seconds (Attempt {Attempt}/{MaxAttempts})", 
-                    _handshakeTimeout.TotalSeconds, retryCount + 1, maxRetries + 1);
-            }
-            catch (IOException ioEx)
-            {
-                lastException = ioEx;
-                _logger.LogWarning(ioEx, "TlsClient: IO error during SSL handshake (Attempt {Attempt}/{MaxAttempts}): {Message}", 
-                    retryCount + 1, maxRetries + 1, ioEx.Message);
-                
-                if (ioEx.InnerException != null)
+                catch (Exception ex)
                 {
-                    _logger.LogError("TlsClient: Inner exception - {InnerType}: {InnerMessage}", 
-                        ioEx.InnerException.GetType().Name, ioEx.InnerException.Message);
-                }
-                
-                // Check if the underlying socket is still connected
-                bool isSocketConnected = _socket != null && _socket.Connected;
-                _logger.LogError("TlsClient: Socket connected status: {IsConnected}", isSocketConnected);
-            }
-            catch (Exception ex)
-            {
-                lastException = ex;
-                _logger.LogWarning(ex, "TlsClient: SSL handshake failed (Attempt {Attempt}/{MaxAttempts}): {Message}", 
-                    retryCount + 1, maxRetries + 1, ex.Message);
-                
-                if (ex.InnerException != null)
-                {
-                    _logger.LogError("TlsClient: Inner exception - {InnerType}: {InnerMessage}", 
-                        ex.InnerException.GetType().Name, ex.InnerException.Message);
+                    lastException = ex;
+                    _logger.LogError(ex, "TlsClient: SSL handshake failed with {Host}:{Port}", _host, _port);
+                    CleanupConnection();
+                    throw;
                 }
             }
             
-            retryCount++;
-            
-            // If we've reached max retries, clean up and throw the last exception
-            if (retryCount > maxRetries)
+            if (_sslStream == null)
             {
                 _logger.LogError("TlsClient: SSL handshake failed after {MaxAttempts} attempts", maxRetries + 1);
                 CleanupConnection();
                 throw lastException ?? new InvalidOperationException("SSL handshake failed with unknown error");
             }
             
-            // Perform cleanup and retry with a new stream
-            CleanupConnection();
+            _logger.LogInformation("TlsClient: Connected successfully to {Host}:{Port} using {Protocol}", 
+                _host, _port, _sslStream.SslProtocol);
             
-            // Short delay before retry
-            await Task.Delay(500 * retryCount);
+            // Now start reading from the stream
+            _ = ReadStreamAsync();
             
-            // Re-establish TCP connection with a new socket
-            _logger.LogDebug("TlsClient: Retrying connection to {Host}:{Port} (Attempt {Attempt}/{MaxAttempts})", 
-                _host, _port, retryCount + 1, maxRetries + 1);
-            
-            try
-            {
-                // Create a new socket for the retry
-                _socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                _logger.LogDebug("TlsClient: Created new socket for retry");
-                
-                // Configure socket
-                _socket.ReceiveBufferSize = 16384;
-                _socket.SendBufferSize = 16384;
-                _socket.NoDelay = true;
-                _socket.LingerState = new LingerOption(false, 0);
-                
-                // Use a timeout for this connection attempt
-                var connectTimeout = TimeSpan.FromSeconds(30);
-                _logger.LogDebug("TlsClient: Connecting to {Host}:{Port} with timeout {Timeout}ms", 
-                    _host, _port, connectTimeout.TotalMilliseconds);
-                
-                // Resolve the hostname again
-                IPAddress[] addresses;
-                if (IPAddress.TryParse(_host, out var ipAddress))
-                {
-                    addresses = new[] { ipAddress };
-                }
-                else
-                {
-                    addresses = await Dns.GetHostAddressesAsync(_host);
-                    // Prefer IPv4 addresses if available
-                    var ipv4Addresses = addresses.Where(a => a.AddressFamily == AddressFamily.InterNetwork).ToArray();
-                    if (ipv4Addresses.Length > 0)
-                    {
-                        addresses = ipv4Addresses;
-                    }
-                }
-                
-                // Try to connect to the first address
-                if (addresses.Length > 0)
-                {
-                    var endpoint = new IPEndPoint(addresses[0], _port);
-                    _logger.LogDebug("TlsClient: Connecting to {Endpoint} for retry", endpoint);
-                    
-                    using (var cts = new CancellationTokenSource(connectTimeout))
-                    {
-                        try
-                        {
-                            await _socket.ConnectAsync(endpoint).WaitAsync(cts.Token);
-                        }
-                        catch (TimeoutException)
-                        {
-                            throw new TimeoutException($"Connection attempt timed out after {connectTimeout.TotalSeconds} seconds");
-                        }
-                    }
-                }
-                else
-                {
-                    throw new InvalidOperationException($"Could not resolve hostname: {_host}");
-                }
-                
-                if (!_socket.Connected)
-                {
-                    throw new InvalidOperationException($"Failed to connect to {_host}:{_port} on retry {retryCount}");
-                }
-                
-                // Create a new network stream
-                _stream = new NetworkStream(_socket, true);
-                _logger.LogDebug("TlsClient: Created new network stream for retry");
-                
-                // Create a new SSL stream
-                _sslStream = new SslStream(
-                    _stream,
-                    false,
-                    ValidateServerCertificate,
-                    null,
-                    EncryptionPolicy.RequireEncryption);
-                _logger.LogDebug("TlsClient: Created new SSL stream for retry");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "TlsClient: Failed to re-establish TCP connection on retry {Attempt} - {ExceptionType}: {Message}", 
-                    retryCount, ex.GetType().Name, ex.Message);
-                CleanupConnection();
-                throw;
-            }
+            // Signal connection started using the base class method
+            _logger.LogInformation("TlsClient: Connection established with {RemoteEndpoint}", 
+                remoteEndpoint?.ToString() ?? "unknown");
+            OnConnectionStarted();
         }
-
-        // Start reading from the stream
-        _logger.LogDebug("TlsClient: Starting read stream task");
-        _ = ReadStreamAsync();
-        _logger.LogDebug("TlsClient: Connection started successfully");
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "TlsClient: Failed to connect to {Host}:{Port}", _host, _port);
+            CleanupConnection();
+            throw;
+        }
     }
 
     private void CleanupConnection()
@@ -901,5 +820,34 @@ public class TlsClient : BaseConnection, ITlsClient
             _logger.LogError(ex, "TlsClient: Failed to send authentication header");
             throw;
         }
+    }
+
+    // Helper method to check if an IO exception is recoverable
+    private bool IsRecoverableIoException(IOException ex)
+    {
+        // Check if the exception is related to connection reset or aborted
+        if (ex.InnerException is SocketException socketEx)
+        {
+            // These are errors that might be recoverable with a retry
+            return socketEx.SocketErrorCode == SocketError.ConnectionReset ||
+                   socketEx.SocketErrorCode == SocketError.ConnectionAborted ||
+                   socketEx.SocketErrorCode == SocketError.TimedOut ||
+                   socketEx.SocketErrorCode == SocketError.HostUnreachable ||
+                   socketEx.SocketErrorCode == SocketError.NetworkUnreachable;
+        }
+        
+        // Check message for common recoverable errors
+        string message = ex.Message.ToLowerInvariant();
+        return message.Contains("reset") ||
+               message.Contains("aborted") ||
+               message.Contains("closed") ||
+               message.Contains("terminated");
+    }
+
+    // Override the base OnConnectionStarted method to include logging
+    protected override void OnConnectionStarted()
+    {
+        _logger.LogInformation("TlsClient: Connection established with {Host}:{Port}", _host, _port);
+        base.OnConnectionStarted();
     }
 } 

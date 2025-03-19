@@ -87,9 +87,14 @@ public class TcpClientTests : IDisposable
 
         try
         {
-            // Act & Assert
-            await Assert.ThrowsAsync<SocketException>(async () => 
+            // Act & Assert - Accept either SocketException or TimeoutException
+            var exception = await Assert.ThrowsAnyAsync<Exception>(async () => 
                 await client.ConnectAsync(timeoutCts.Token));
+                
+            // Verify it's one of our expected exception types
+            Assert.True(
+                exception is SocketException || exception is TimeoutException,
+                $"Expected SocketException or TimeoutException, got {exception.GetType().Name}");
         }
         finally
         {

@@ -1,35 +1,167 @@
 using CsProxyTools.Interfaces;
 using Microsoft.Extensions.Logging;
+using System.Net.Sockets;
 
 namespace CsProxyTools.Helpers;
+
+/// <summary>
+/// Delegate that creates a new client connection for a given connection ID
+/// </summary>
+/// <param name="connectionId">The unique ID of the connection</param>
+/// <returns>A new IClient instance</returns>
+public delegate IClient ClientFactory(string connectionId);
 
 public class ProxyConnection : IAsyncDisposable
 {
     private readonly IConnection _client;
-    private readonly IConnection _server;
+    private readonly IClient _server;
     private readonly ILogger _logger;
     private readonly string _clientId;
     private readonly string _serverId;
     private bool _isDisposed;
+    private readonly CancellationTokenSource _cts = new CancellationTokenSource();
+    
+    // Connection timeouts and retry settings
+    private const int ConnectionTimeoutMs = 30000; // 30 seconds total timeout
+    private const int MaxRetryAttempts = 5;
+    private const int RetryDelayMs = 1000; // 1 second between retries
 
+    /// <summary>
+    /// Creates a new proxy connection with a specific target client
+    /// </summary>
     public ProxyConnection(
-        IConnection client,
-        IConnection server,
         ILogger logger,
-        string? clientId = null,
-        string? serverId = null)
+        string clientId, 
+        IConnection client,
+        IClient server)
     {
         _client = client;
         _server = server;
         _logger = logger;
-        _clientId = clientId ?? client.Id;
-        _serverId = serverId ?? server.Id;
+        _clientId = clientId;
+        _serverId = server.Id;
 
         // Set up event handlers
         _client.DataReceived += Client_DataReceived;
         _server.DataReceived += Server_DataReceived;
         _client.ConnectionClosed += Client_Disconnected;
-        _server.ConnectionClosed += Server_Disconnected;
+        _server.Disconnected += Server_Disconnected;
+    }
+    
+    /// <summary>
+    /// Creates a new proxy connection with a factory to create the target client
+    /// </summary>
+    public ProxyConnection(
+        ILogger logger,
+        string clientId, 
+        IConnection client,
+        ClientFactory createTargetClient)
+    {
+        _client = client;
+        _logger = logger;
+        _clientId = clientId;
+        
+        // Create the target client using the factory
+        _server = createTargetClient(clientId);
+        _serverId = _server.Id;
+
+        // Set up event handlers
+        _client.DataReceived += Client_DataReceived;
+        _server.DataReceived += Server_DataReceived;
+        _client.ConnectionClosed += Client_Disconnected;
+        _server.Disconnected += Server_Disconnected;
+    }
+
+    public async Task Start()
+    {
+        try 
+        {
+            _logger.LogInformation("Starting proxy connection between client {ClientId} and server {ServerId}", 
+                _clientId, _serverId);
+            
+            // Connect to the server with retry logic
+            bool connected = false;
+            int attemptCount = 0;
+            Exception? lastException = null;
+            
+            // Set a timeout for the entire connect operation
+            using var timeoutCts = new CancellationTokenSource(ConnectionTimeoutMs);
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                timeoutCts.Token, _cts.Token);
+            
+            while (attemptCount < MaxRetryAttempts && !connected)
+            {
+                try
+                {
+                    attemptCount++;
+                    _logger.LogDebug("Connecting to target server, attempt {Attempt}/{MaxAttempts}", 
+                        attemptCount, MaxRetryAttempts);
+                    
+                    await _server.ConnectAsync(linkedCts.Token);
+                    connected = true;
+                    
+                    _logger.LogInformation("Successfully connected to target server on attempt {Attempt}", attemptCount);
+                }
+                catch (OperationCanceledException)
+                {
+                    if (timeoutCts.IsCancellationRequested)
+                    {
+                        _logger.LogError("Connection to target server timed out after {TimeoutMs}ms", ConnectionTimeoutMs);
+                        throw new TimeoutException($"Connection to target server timed out after {ConnectionTimeoutMs}ms");
+                    }
+                    
+                    throw; // Rethrow if it's from our internal _cts
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+                    
+                    if (attemptCount < MaxRetryAttempts)
+                    {
+                        _logger.LogWarning(ex, "Failed to connect to target server on attempt {Attempt}/{MaxAttempts}, " + 
+                            "retrying in {RetryDelayMs}ms...", attemptCount, MaxRetryAttempts, RetryDelayMs);
+                        
+                        try
+                        {
+                            await Task.Delay(RetryDelayMs, linkedCts.Token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            if (timeoutCts.IsCancellationRequested)
+                            {
+                                _logger.LogError("Connection to target server timed out after {TimeoutMs}ms", ConnectionTimeoutMs);
+                                throw new TimeoutException($"Connection to target server timed out after {ConnectionTimeoutMs}ms");
+                            }
+                            
+                            throw; // Rethrow if it's from our internal _cts
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogError(ex, "Failed to connect to target server after {MaxAttempts} attempts", MaxRetryAttempts);
+                        throw;
+                    }
+                }
+            }
+            
+            if (!connected)
+            {
+                if (lastException != null)
+                {
+                    throw lastException;
+                }
+                throw new InvalidOperationException($"Failed to connect to target server");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error starting proxy connection between client {ClientId} and server {ServerId}", 
+                _clientId, _serverId);
+            
+            // Clean up and propagate the error
+            await DisposeAsync();
+            throw;
+        }
     }
 
     private void Client_DataReceived(object? sender, DataReceivedEventArgs args)
@@ -71,7 +203,17 @@ public class ProxyConnection : IAsyncDisposable
         var clientEndpoint = args.RemoteEndpoint ?? "unknown";
         _logger.LogInformation("Client {ClientEndpoint}:{ClientId} connection closed", 
             clientEndpoint, _clientId);
-        _server.StopAsync().GetAwaiter().GetResult();
+        
+        // Cancel any ongoing operations
+        _cts.Cancel();
+        
+        // Disconnect the server
+        _server.DisconnectAsync().ContinueWith(t => {
+            if (t.IsFaulted)
+            {
+                _logger.LogError(t.Exception, "Error disconnecting server after client disconnected");
+            }
+        });
     }
 
     private void Server_Disconnected(object? sender, ConnectionEventArgs args)
@@ -79,7 +221,17 @@ public class ProxyConnection : IAsyncDisposable
         var serverEndpoint = args.RemoteEndpoint ?? "unknown";
         _logger.LogInformation("Server {ServerEndpoint}:{ServerId} connection closed", 
             serverEndpoint, _serverId);
-        _client.StopAsync().GetAwaiter().GetResult();
+        
+        // Cancel any ongoing operations
+        _cts.Cancel();
+        
+        // Disconnect the client
+        _client.StopAsync().ContinueWith(t => {
+            if (t.IsFaulted)
+            {
+                _logger.LogError(t.Exception, "Error disconnecting client after server disconnected");
+            }
+        });
     }
 
     public async ValueTask DisposeAsync()
@@ -88,15 +240,24 @@ public class ProxyConnection : IAsyncDisposable
 
         try
         {
+            // Cancel any ongoing operations
+            if (!_cts.IsCancellationRequested)
+            {
+                _cts.Cancel();
+            }
+            
             // Remove event handlers
             _client.DataReceived -= Client_DataReceived;
             _server.DataReceived -= Server_DataReceived;
             _client.ConnectionClosed -= Client_Disconnected;
-            _server.ConnectionClosed -= Server_Disconnected;
+            _server.Disconnected -= Server_Disconnected;
 
             // Dispose both connections
             await _client.DisposeAsync();
             await _server.DisposeAsync();
+            
+            // Dispose cancellation token source
+            _cts.Dispose();
 
             _isDisposed = true;
         }
