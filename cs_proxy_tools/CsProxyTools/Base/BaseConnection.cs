@@ -161,7 +161,7 @@ public abstract class BaseConnection : IConnection
         _logger.LogDebug("BaseConnection: ProcessStreamAsync started for {Id}", Id);
         try
         {
-            while (!_cancellationTokenSource.Token.IsCancellationRequested)
+            while (!_isDisposed && !_cancellationTokenSource.IsCancellationRequested)
             {
                 _logger.LogTrace("BaseConnection: Reading from pipe for {Id}", Id);
                 var result = await ReadAsync();

@@ -86,8 +86,9 @@ public class ProxyConnection : IAsyncDisposable
             
             // Set a timeout for the entire connect operation
             using var timeoutCts = new CancellationTokenSource(ConnectionTimeoutMs);
-            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
-                timeoutCts.Token, _cts.Token);
+            using var linkedCts = !_cts.IsCancellationRequested ? 
+                CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, _cts.Token) : 
+                CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token);
             
             while (attemptCount < MaxRetryAttempts && !connected)
             {
@@ -204,8 +205,18 @@ public class ProxyConnection : IAsyncDisposable
         _logger.LogInformation("Client {ClientEndpoint}:{ClientId} connection closed", 
             clientEndpoint, _clientId);
         
-        // Cancel any ongoing operations
-        _cts.Cancel();
+        // Cancel any ongoing operations safely
+        if (!_cts.IsCancellationRequested)
+        {
+            try
+            {
+                _cts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Token was already disposed, ignore
+            }
+        }
         
         // Disconnect the server
         _server.DisconnectAsync().ContinueWith(t => {
@@ -222,8 +233,18 @@ public class ProxyConnection : IAsyncDisposable
         _logger.LogInformation("Server {ServerEndpoint}:{ServerId} connection closed", 
             serverEndpoint, _serverId);
         
-        // Cancel any ongoing operations
-        _cts.Cancel();
+        // Cancel any ongoing operations safely
+        if (!_cts.IsCancellationRequested)
+        {
+            try
+            {
+                _cts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Token was already disposed, ignore
+            }
+        }
         
         // Disconnect the client
         _client.StopAsync().ContinueWith(t => {
@@ -240,26 +261,56 @@ public class ProxyConnection : IAsyncDisposable
 
         try
         {
-            // Cancel any ongoing operations
+            // Set the disposed flag first to prevent race conditions
+            _isDisposed = true;
+            
+            // Cancel any ongoing operations safely
             if (!_cts.IsCancellationRequested)
             {
-                _cts.Cancel();
+                try
+                {
+                    _cts.Cancel();
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Token was already disposed, ignore
+                }
             }
             
-            // Remove event handlers
+            // Remove event handlers to prevent further callbacks
             _client.DataReceived -= Client_DataReceived;
             _server.DataReceived -= Server_DataReceived;
             _client.ConnectionClosed -= Client_Disconnected;
             _server.Disconnected -= Server_Disconnected;
 
             // Dispose both connections
-            await _client.DisposeAsync();
-            await _server.DisposeAsync();
+            try
+            {
+                await _client.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error disposing client connection {ClientId}", _clientId);
+            }
             
-            // Dispose cancellation token source
-            _cts.Dispose();
-
-            _isDisposed = true;
+            try
+            {
+                await _server.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error disposing server connection {ServerId}", _serverId);
+            }
+            
+            // Dispose cancellation token source safely
+            try
+            {
+                _cts.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error disposing cancellation token source");
+            }
         }
         catch (Exception ex)
         {
